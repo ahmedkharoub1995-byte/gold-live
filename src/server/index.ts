@@ -49,6 +49,37 @@ type HistoricalMeta = {
 	source: "historical_rest";
 };
 
+type NormalizedOneHourCandle = {
+	timeframe: "1h";
+	datetime: string;
+	open_time: string;
+	expected_close_time: string;
+	open: number;
+	high: number;
+	low: number;
+	close: number;
+	status: "OPEN" | "CLOSED";
+	source: "historical_rest" | "synthetic_gap";
+	provisional: false;
+	confirmed: true;
+	synthetic_gap: boolean;
+	stored_at_ms: number;
+};
+
+type NormalizedMeta = {
+	timeframe: "1h";
+	last_normalized_ms: number;
+	last_normalized_time: string;
+	latest_datetime: string | null;
+	oldest_datetime: string | null;
+	raw_rows_seen: number;
+	valid_raw_rows: number;
+	filtered_closed_rows: number;
+	synthetic_gap_rows: number;
+	pending_closed_period: boolean;
+	layer: "analysis_normalized";
+};
+
 type HistoricalWorkerPayload = {
 	status?: string;
 	symbol?: string;
@@ -148,6 +179,97 @@ function historicalPrefix(interval: RestInterval) {
 
 function historicalMetaKey(interval: RestInterval) {
 	return `meta:${interval}`;
+}
+
+function normalizedOneHourKey(datetime: string) {
+	return `norm:1h:${datetime}`;
+}
+
+function normalizedOneHourPrefix() {
+	return "norm:1h:";
+}
+
+function normalizedOneHourMetaKey() {
+	return "normmeta:1h";
+}
+
+function parseCairoDatetimeParts(datetime: string) {
+	const match = datetime.match(
+		/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/,
+	);
+
+	if (!match) return null;
+
+	const [, y, mo, d, h, mi, s] = match;
+
+	return {
+		year: Number(y),
+		month: Number(mo),
+		day: Number(d),
+		hour: Number(h),
+		minute: Number(mi),
+		second: Number(s),
+	};
+}
+
+function cairoDatetimeToMs(datetime: string) {
+	const parts = parseCairoDatetimeParts(datetime);
+	if (!parts) return null;
+
+	// Project rule: Cairo is treated as fixed GMT+3.
+	return (
+		Date.UTC(
+			parts.year,
+			parts.month - 1,
+			parts.day,
+			parts.hour,
+			parts.minute,
+			parts.second,
+		) -
+		3 * 60 * 60 * 1000
+	);
+}
+
+function addMinutesToCairoDatetime(datetime: string, minutes: number) {
+	const ms = cairoDatetimeToMs(datetime);
+	if (ms === null) return datetime;
+	return cairoTime(ms + minutes * 60_000);
+}
+
+function cairoDayOfWeek(datetime: string) {
+	const parts = parseCairoDatetimeParts(datetime);
+	if (!parts) return null;
+
+	// Day-of-week from the local Cairo calendar date itself.
+	return new Date(
+		Date.UTC(parts.year, parts.month - 1, parts.day),
+	).getUTCDay();
+}
+
+function isClosedMarketCairoDatetime(datetime: string) {
+	const parts = parseCairoDatetimeParts(datetime);
+	const day = cairoDayOfWeek(datetime);
+
+	if (!parts || day === null) return false;
+
+	// Weekend closure: Saturday 00:00 -> Monday 01:00 Cairo.
+	if (day === 6 || day === 0) return true;
+	if (day === 1 && parts.hour < 1) return true;
+
+	// Daily closure: 00:00 -> 01:00 Cairo.
+	return parts.hour < 1;
+}
+
+function statusFromExpectedClose(expectedCloseTime: string) {
+	const closeMs = cairoDatetimeToMs(expectedCloseTime);
+
+	if (closeMs === null) {
+		return "CLOSED" as const;
+	}
+
+	return Date.now() >= closeMs
+		? ("CLOSED" as const)
+		: ("OPEN" as const);
 }
 
 function parseFiniteNumber(value: unknown) {
@@ -420,6 +542,105 @@ export class Chat extends DurableObject<LiveEnv> {
 			});
 		}
 
+		if (url.pathname === "/normalize") {
+			const interval =
+				url.searchParams.get("interval") ?? "1h";
+
+			if (interval !== "1h") {
+				return json(
+					{
+						status: "error",
+						error:
+							"Stage 1 normalization currently supports 1h only.",
+						note:
+							"Other timeframes will use the same managed-data rules after the 1h session/gap engine is verified.",
+					},
+					400,
+				);
+			}
+
+			const result = await this.normalizeStoredOneHour();
+
+			return json(
+				result,
+				result.status === "ok" ? 200 : 500,
+			);
+		}
+
+		if (url.pathname === "/normalized-data") {
+			const interval =
+				url.searchParams.get("interval") ?? "1h";
+
+			if (interval !== "1h") {
+				return json(
+					{
+						status: "error",
+						error:
+							"Stage 1 normalized storage currently supports 1h only.",
+					},
+					400,
+				);
+			}
+
+			let limit = Number(url.searchParams.get("limit") ?? 100);
+
+			if (!Number.isInteger(limit) || limit < 1) {
+				limit = 100;
+			}
+
+			limit = Math.min(limit, 1000);
+
+			const rows =
+				await this.ctx.storage.list<NormalizedOneHourCandle>({
+					prefix: normalizedOneHourPrefix(),
+					reverse: true,
+					limit,
+				});
+
+			const candles = Array.from(rows.values()).sort((a, b) =>
+				b.datetime.localeCompare(a.datetime),
+			);
+
+			const meta =
+				(await this.ctx.storage.get<NormalizedMeta>(
+					normalizedOneHourMetaKey(),
+				)) ?? null;
+
+			return json({
+				status: "ok",
+				symbol: SYMBOL,
+				timezone: TIMEZONE,
+				interval: "1h",
+				layer: "analysis_normalized",
+				count: candles.length,
+				meta,
+				columns: [
+					"datetime",
+					"open_time",
+					"expected_close_time",
+					"open",
+					"high",
+					"low",
+					"close",
+					"status",
+					"source",
+					"synthetic_gap",
+				],
+				candles: candles.map((c) => [
+					c.datetime,
+					c.open_time,
+					c.expected_close_time,
+					c.open,
+					c.high,
+					c.low,
+					c.close,
+					statusFromExpectedClose(c.expected_close_time),
+					c.source,
+					c.synthetic_gap,
+				]),
+			});
+		}
+
 		if (url.pathname === "/storage-state") {
 			const frames = [];
 
@@ -568,6 +789,10 @@ export class Chat extends DurableObject<LiveEnv> {
 					"/sync?interval=all&outputsize=100",
 				data:
 					"/data?interval=1h&limit=100",
+				normalize:
+					"/normalize?interval=1h",
+				normalized_data:
+					"/normalized-data?interval=1h&limit=100",
 				storage_state: "/storage-state",
 			},
 
@@ -575,6 +800,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				live_ticks: "provisional",
 				historical_rest: "authoritative",
 				persistent_storage: "raw REST candles by timeframe",
+				normalized_storage:
+					"session-filtered candles + synthetic gap candles; no market-analysis logic",
 				analysis:
 					"ChatGPT only — Worker does not detect FVG, liquidity, sweeps, mitigation, or market structure",
 			},
@@ -936,7 +1163,9 @@ export class Chat extends DurableObject<LiveEnv> {
 			const now = Date.now();
 			const validRows: StoredHistoricalCandle[] = [];
 
-			for (const row of payload.candles) {
+			const rowsToStore = payload.candles.slice(0, outputsize);
+
+			for (const row of rowsToStore) {
 				if (!Array.isArray(row) || row.length < 5) {
 					continue;
 				}
@@ -1043,6 +1272,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				interval,
 				requested_outputsize: outputsize,
 				rows_received: payload.candles.length,
+				rows_considered_after_requested_limit: rowsToStore.length,
 				rows_validated_and_stored: validRows.length,
 				request_newest: requestNewest,
 				request_oldest: requestOldest,
@@ -1057,6 +1287,216 @@ export class Chat extends DurableObject<LiveEnv> {
 			return {
 				status: "error",
 				interval,
+				error:
+					error instanceof Error
+						? error.message
+						: String(error),
+			};
+		}
+	}
+
+	private async normalizeStoredOneHour() {
+		try {
+			const rawMap =
+				await this.ctx.storage.list<StoredHistoricalCandle>({
+					prefix: historicalPrefix("1h"),
+					limit: 1000,
+				});
+
+			const raw = Array.from(rawMap.values()).sort((a, b) =>
+				a.datetime.localeCompare(b.datetime),
+			);
+
+			if (raw.length === 0) {
+				return {
+					status: "error",
+					error: "No stored 1h raw REST candles found",
+				};
+			}
+
+			const normalized: NormalizedOneHourCandle[] = [];
+			let filteredClosedRows = 0;
+			let syntheticGapRows = 0;
+			let pendingClosedPeriod = false;
+
+			let lastValid: StoredHistoricalCandle | null = null;
+			let gapOpen: {
+				start_datetime: string;
+				previous_close: number;
+			} | null = null;
+
+			for (const candle of raw) {
+				const closedMarket =
+					isClosedMarketCairoDatetime(candle.datetime);
+
+				if (closedMarket) {
+					filteredClosedRows++;
+
+					if (lastValid && !gapOpen) {
+						gapOpen = {
+							start_datetime:
+								addMinutesToCairoDatetime(
+									lastValid.datetime,
+									60,
+								),
+							previous_close: lastValid.close,
+						};
+					}
+
+					continue;
+				}
+
+				if (gapOpen) {
+					const gapClose = candle.open;
+					const gapExpectedClose = candle.datetime;
+
+					normalized.push({
+						timeframe: "1h",
+						datetime: gapOpen.start_datetime,
+						open_time: gapOpen.start_datetime,
+						expected_close_time: gapExpectedClose,
+						open: gapOpen.previous_close,
+						high: Math.max(
+							gapOpen.previous_close,
+							gapClose,
+						),
+						low: Math.min(
+							gapOpen.previous_close,
+							gapClose,
+						),
+						close: gapClose,
+						status:
+							statusFromExpectedClose(
+								gapExpectedClose,
+							),
+						source: "synthetic_gap",
+						provisional: false,
+						confirmed: true,
+						synthetic_gap: true,
+						stored_at_ms: Date.now(),
+					});
+
+					syntheticGapRows++;
+					gapOpen = null;
+				}
+
+				const expectedCloseTime =
+					addMinutesToCairoDatetime(
+						candle.datetime,
+						60,
+					);
+
+				normalized.push({
+					timeframe: "1h",
+					datetime: candle.datetime,
+					open_time: candle.datetime,
+					expected_close_time: expectedCloseTime,
+					open: candle.open,
+					high: candle.high,
+					low: candle.low,
+					close: candle.close,
+					status:
+						statusFromExpectedClose(
+							expectedCloseTime,
+						),
+					source: "historical_rest",
+					provisional: false,
+					confirmed: true,
+					synthetic_gap: false,
+					stored_at_ms: Date.now(),
+				});
+
+				lastValid = candle;
+			}
+
+			if (gapOpen) {
+				pendingClosedPeriod = true;
+			}
+
+			// Clear previous normalized 1h layer, then rebuild it.
+			const oldNormalized =
+				await this.ctx.storage.list<NormalizedOneHourCandle>({
+					prefix: normalizedOneHourPrefix(),
+					limit: 1000,
+				});
+
+			if (oldNormalized.size > 0) {
+				await this.ctx.storage.delete(
+					Array.from(oldNormalized.keys()),
+				);
+			}
+
+			for (let i = 0; i < normalized.length; i += 100) {
+				const batch = normalized.slice(i, i + 100);
+				const entries: Record<
+					string,
+					NormalizedOneHourCandle
+				> = {};
+
+				for (const candle of batch) {
+					entries[
+						normalizedOneHourKey(
+							candle.datetime,
+						)
+					] = candle;
+				}
+
+				await this.ctx.storage.put(entries);
+			}
+
+			const datetimes = normalized
+				.map((c) => c.datetime)
+				.sort();
+
+			const now = Date.now();
+
+			const meta: NormalizedMeta = {
+				timeframe: "1h",
+				last_normalized_ms: now,
+				last_normalized_time: cairoTime(now),
+				latest_datetime:
+					datetimes.length > 0
+						? datetimes[datetimes.length - 1]
+						: null,
+				oldest_datetime:
+					datetimes.length > 0
+						? datetimes[0]
+						: null,
+				raw_rows_seen: raw.length,
+				valid_raw_rows:
+					raw.length - filteredClosedRows,
+				filtered_closed_rows: filteredClosedRows,
+				synthetic_gap_rows: syntheticGapRows,
+				pending_closed_period: pendingClosedPeriod,
+				layer: "analysis_normalized",
+			};
+
+			await this.ctx.storage.put(
+				normalizedOneHourMetaKey(),
+				meta,
+			);
+
+			return {
+				status: "ok",
+				symbol: SYMBOL,
+				timezone: TIMEZONE,
+				interval: "1h",
+				layer: "analysis_normalized",
+				raw_rows_seen: raw.length,
+				valid_raw_rows: meta.valid_raw_rows,
+				filtered_closed_rows: filteredClosedRows,
+				synthetic_gap_rows: syntheticGapRows,
+				pending_closed_period: pendingClosedPeriod,
+				normalized_rows_stored: normalized.length,
+				oldest_datetime: meta.oldest_datetime,
+				latest_datetime: meta.latest_datetime,
+				analysis_performed: false,
+				note:
+					"Worker only filters closed-market rows, inserts synthetic gap candles, and adds candle timing/status metadata. FVG, liquidity, sweeps, mitigation, and structure remain ChatGPT-only.",
+			};
+		} catch (error) {
+			return {
+				status: "error",
 				error:
 					error instanceof Error
 						? error.message
