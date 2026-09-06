@@ -35,6 +35,10 @@ const NORMALIZED_REST_INTERVALS = [
 type NormalizedRestInterval =
 	(typeof NORMALIZED_REST_INTERVALS)[number];
 
+type AnalysisNormalizedInterval =
+	| NormalizedRestInterval
+	| "3min";
+
 const NORMALIZED_INTERVAL_MINUTES: Record<
 	NormalizedRestInterval,
 	number
@@ -72,7 +76,7 @@ type HistoricalMeta = {
 };
 
 type NormalizedCandle = {
-	timeframe: NormalizedRestInterval;
+	timeframe: AnalysisNormalizedInterval;
 	datetime: string;
 	open_time: string;
 	expected_close_time: string;
@@ -81,7 +85,10 @@ type NormalizedCandle = {
 	low: number;
 	close: number;
 	status: "OPEN" | "CLOSED";
-	source: "historical_rest" | "synthetic_gap";
+	source:
+		| "historical_rest"
+		| "synthetic_gap"
+		| "derived_1min";
 	provisional: false;
 	confirmed: true;
 	synthetic_gap: boolean;
@@ -98,6 +105,23 @@ type NormalizedMeta = {
 	valid_raw_rows: number;
 	filtered_closed_rows: number;
 	synthetic_gap_rows: number;
+	pending_closed_period: boolean;
+	layer: "analysis_normalized";
+};
+
+type Derived3MinMeta = {
+	timeframe: "3min";
+	last_normalized_ms: number;
+	last_normalized_time: string;
+	latest_datetime: string | null;
+	oldest_datetime: string | null;
+	source_interval: "1min";
+	source_rows_seen: number;
+	source_regular_rows: number;
+	source_synthetic_gap_rows: number;
+	complete_3min_buckets: number;
+	incomplete_3min_buckets: number;
+	derived_rows_stored: number;
 	pending_closed_period: boolean;
 	layer: "analysis_normalized";
 };
@@ -187,24 +211,10 @@ function minuteStart(ms: number) {
 }
 
 function cairoTime(ms: number) {
-	const parts = new Intl.DateTimeFormat("en-CA", {
-		timeZone: TIMEZONE,
-		year: "numeric",
-		month: "2-digit",
-		day: "2-digit",
-		hour: "2-digit",
-		minute: "2-digit",
-		second: "2-digit",
-		hourCycle: "h23",
-	}).formatToParts(new Date(ms));
-
-	const get = (type: string) =>
-		parts.find((p) => p.type === type)?.value ?? "";
-
-	return (
-		`${get("year")}-${get("month")}-${get("day")} ` +
-		`${get("hour")}:${get("minute")}:${get("second")}`
-	);
+	// Project rule: Cairo is always treated as fixed GMT+3.
+	// Do not use Africa/Cairo DST rules here.
+	const shifted = new Date(ms + 3 * 60 * 60 * 1000);
+	return shifted.toISOString().slice(0, 19).replace("T", " ");
 }
 
 function isRestInterval(value: string): value is RestInterval {
@@ -231,21 +241,30 @@ function isNormalizedRestInterval(
 	).includes(value);
 }
 
+function isAnalysisNormalizedInterval(
+	value: string,
+): value is AnalysisNormalizedInterval {
+	return (
+		value === "3min" ||
+		isNormalizedRestInterval(value)
+	);
+}
+
 function normalizedCandleKey(
-	interval: NormalizedRestInterval,
+	interval: AnalysisNormalizedInterval,
 	datetime: string,
 ) {
 	return `norm:${interval}:${datetime}`;
 }
 
 function normalizedPrefix(
-	interval: NormalizedRestInterval,
+	interval: AnalysisNormalizedInterval,
 ) {
 	return `norm:${interval}:`;
 }
 
 function normalizedMetaKey(
-	interval: NormalizedRestInterval,
+	interval: AnalysisNormalizedInterval,
 ) {
 	return `normmeta:${interval}`;
 }
@@ -301,6 +320,20 @@ function addMinutesToCairoDatetime(
 	const ms = cairoDatetimeToMs(datetime);
 	if (ms === null) return datetime;
 	return cairoTime(ms + minutes * 60_000);
+}
+
+function threeMinuteBucketStart(datetime: string) {
+	const parts = parseCairoDatetimeParts(datetime);
+	if (!parts) return null;
+
+	const bucketMinute = Math.floor(parts.minute / 3) * 3;
+
+	const pad = (n: number) => String(n).padStart(2, "0");
+
+	return (
+		`${parts.year}-${pad(parts.month)}-${pad(parts.day)} ` +
+		`${pad(parts.hour)}:${pad(bucketMinute)}:00`
+	);
 }
 
 function cairoDayOfWeek(datetime: string) {
@@ -621,6 +654,10 @@ export class Chat extends DurableObject<LiveEnv> {
 					);
 				}
 
+				// 3min is derived only after the authoritative 1min
+				// normalized layer has been rebuilt.
+				results.push(await this.deriveThreeMinuteFromOneMinute());
+
 				return json({
 					status: "ok",
 					mode: "all",
@@ -632,16 +669,32 @@ export class Chat extends DurableObject<LiveEnv> {
 				});
 			}
 
+			if (requestedInterval === "3min") {
+				const result =
+					await this.deriveThreeMinuteFromOneMinute();
+
+				return json(
+					result,
+					result.status === "ok" ? 200 : 500,
+				);
+			}
+
 			if (!isNormalizedRestInterval(requestedInterval)) {
 				return json(
 					{
 						status: "error",
 						error:
-							"Normalization currently supports 1min, 5min, 15min, 30min, and 1h only.",
-						supported_intervals:
-							NORMALIZED_REST_INTERVALS,
+							"Normalization supports 1min, 3min, 5min, 15min, 30min, and 1h.",
+						supported_intervals: [
+							"1min",
+							"3min",
+							"5min",
+							"15min",
+							"30min",
+							"1h",
+						],
 						note:
-							"4h and higher are intentionally deferred until native candle boundary behavior is validated.",
+							"3min is derived deterministically from normalized 1min. 4h and higher remain deferred until native candle boundary behavior is validated.",
 					},
 					400,
 				);
@@ -660,14 +713,20 @@ export class Chat extends DurableObject<LiveEnv> {
 			const interval =
 				url.searchParams.get("interval") ?? "1h";
 
-			if (!isNormalizedRestInterval(interval)) {
+			if (!isAnalysisNormalizedInterval(interval)) {
 				return json(
 					{
 						status: "error",
 						error:
-							"Normalized storage currently supports 1min, 5min, 15min, 30min, and 1h only.",
-						supported_intervals:
-							NORMALIZED_REST_INTERVALS,
+							"Normalized storage supports 1min, 3min, 5min, 15min, 30min, and 1h.",
+						supported_intervals: [
+							"1min",
+							"3min",
+							"5min",
+							"15min",
+							"30min",
+							"1h",
+						],
 					},
 					400,
 				);
@@ -693,7 +752,9 @@ export class Chat extends DurableObject<LiveEnv> {
 			);
 
 			const meta =
-				(await this.ctx.storage.get<NormalizedMeta>(
+				(await this.ctx.storage.get<
+					NormalizedMeta | Derived3MinMeta
+				>(
 					normalizedMetaKey(interval),
 				)) ?? null;
 
@@ -885,10 +946,14 @@ export class Chat extends DurableObject<LiveEnv> {
 					"/data?interval=1h&limit=100",
  				normalize:
 					"/normalize?interval=1min",
+				derive_3min:
+					"/normalize?interval=3min",
 				normalize_all_supported:
 					"/normalize?interval=all",
 				normalized_data:
 					"/normalized-data?interval=1min&limit=100",
+				normalized_3min:
+					"/normalized-data?interval=3min&limit=100",
 				storage_state: "/storage-state",
 				purge:
 					"/purge?interval=1min&confirm=yes",
@@ -1816,6 +1881,266 @@ export class Chat extends DurableObject<LiveEnv> {
 			return {
 				status: "error",
 				interval,
+				error:
+					error instanceof Error
+						? error.message
+						: String(error),
+			};
+		}
+	}
+
+	private async deriveThreeMinuteFromOneMinute() {
+		try {
+			const source: NormalizedCandle[] = [];
+			let startAfter: string | undefined;
+
+			while (true) {
+				const page =
+					await this.ctx.storage.list<NormalizedCandle>({
+						prefix: normalizedPrefix("1min"),
+						limit: 1000,
+						...(startAfter ? { startAfter } : {}),
+					});
+
+				if (page.size === 0) {
+					break;
+				}
+
+				source.push(...page.values());
+
+				if (page.size < 1000) {
+					break;
+				}
+
+				const keys = Array.from(page.keys()) as string[];
+				startAfter = keys[keys.length - 1];
+			}
+
+			source.sort((a, b) =>
+				a.datetime.localeCompare(b.datetime),
+			);
+
+			if (source.length === 0) {
+				return {
+					status: "error",
+					interval: "3min",
+					error:
+						"No normalized 1min candles found. Run /normalize?interval=1min first.",
+				};
+			}
+
+			const sourceMeta =
+				(await this.ctx.storage.get<NormalizedMeta>(
+					normalizedMetaKey("1min"),
+				)) ?? null;
+
+			const regularRows = source.filter(
+				(c) => !c.synthetic_gap,
+			);
+			const gapRows = source.filter(
+				(c) => c.synthetic_gap,
+			);
+
+			const buckets = new Map<string, NormalizedCandle[]>();
+
+			for (const candle of regularRows) {
+				const bucketStart =
+					threeMinuteBucketStart(candle.datetime);
+
+				if (!bucketStart) {
+					continue;
+				}
+
+				const bucket = buckets.get(bucketStart) ?? [];
+				bucket.push(candle);
+				buckets.set(bucketStart, bucket);
+			}
+
+			const derived: NormalizedCandle[] = [];
+			let completeBuckets = 0;
+			let incompleteBuckets = 0;
+
+			for (const [bucketStart, rows] of buckets.entries()) {
+				rows.sort((a, b) =>
+					a.datetime.localeCompare(b.datetime),
+				);
+
+				const expectedDatetimes = [
+					bucketStart,
+					addMinutesToCairoDatetime(bucketStart, 1),
+					addMinutesToCairoDatetime(bucketStart, 2),
+				];
+
+				const actualDatetimes = rows.map((c) => c.datetime);
+
+				const complete =
+					rows.length === 3 &&
+					expectedDatetimes.every(
+						(value, index) =>
+							actualDatetimes[index] === value,
+					);
+
+				if (!complete) {
+					incompleteBuckets++;
+					continue;
+				}
+
+				const expectedCloseTime =
+					addMinutesToCairoDatetime(bucketStart, 3);
+
+				derived.push({
+					timeframe: "3min",
+					datetime: bucketStart,
+					open_time: bucketStart,
+					expected_close_time: expectedCloseTime,
+					open: rows[0].open,
+					high: Math.max(...rows.map((c) => c.high)),
+					low: Math.min(...rows.map((c) => c.low)),
+					close: rows[2].close,
+					status:
+						statusFromExpectedClose(
+							expectedCloseTime,
+						),
+					source: "derived_1min",
+					provisional: false,
+					confirmed: true,
+					synthetic_gap: false,
+					stored_at_ms: Date.now(),
+				});
+
+				completeBuckets++;
+			}
+
+			// A completed closure remains its own standalone synthetic
+			// gap candle and is never folded into a normal 3min bucket.
+			for (const gap of gapRows) {
+				derived.push({
+					timeframe: "3min",
+					datetime: gap.datetime,
+					open_time: gap.open_time,
+					expected_close_time: gap.expected_close_time,
+					open: gap.open,
+					high: gap.high,
+					low: gap.low,
+					close: gap.close,
+					status:
+						statusFromExpectedClose(
+							gap.expected_close_time,
+						),
+					source: "synthetic_gap",
+					provisional: false,
+					confirmed: true,
+					synthetic_gap: true,
+					stored_at_ms: Date.now(),
+				});
+			}
+
+			derived.sort((a, b) =>
+				a.datetime.localeCompare(b.datetime),
+			);
+
+			// Rebuild only the derived 3min layer.
+			while (true) {
+				const oldPage =
+					await this.ctx.storage.list<NormalizedCandle>({
+						prefix: normalizedPrefix("3min"),
+						limit: 500,
+					});
+
+				if (oldPage.size === 0) {
+					break;
+				}
+
+				const keys = Array.from(oldPage.keys());
+
+				for (let i = 0; i < keys.length; i += 100) {
+					await this.ctx.storage.delete(
+						keys.slice(i, i + 100),
+					);
+				}
+			}
+
+			for (let i = 0; i < derived.length; i += 100) {
+				const batch = derived.slice(i, i + 100);
+				const entries: Record<
+					string,
+					NormalizedCandle
+				> = {};
+
+				for (const candle of batch) {
+					entries[
+						normalizedCandleKey(
+							"3min",
+							candle.datetime,
+						)
+					] = candle;
+				}
+
+				await this.ctx.storage.put(entries);
+			}
+
+			const datetimes = derived
+				.map((c) => c.datetime)
+				.sort();
+
+			const now = Date.now();
+
+			const meta: Derived3MinMeta = {
+				timeframe: "3min",
+				last_normalized_ms: now,
+				last_normalized_time: cairoTime(now),
+				latest_datetime:
+					datetimes.length > 0
+						? datetimes[datetimes.length - 1]
+						: null,
+				oldest_datetime:
+					datetimes.length > 0
+						? datetimes[0]
+						: null,
+				source_interval: "1min",
+				source_rows_seen: source.length,
+				source_regular_rows: regularRows.length,
+				source_synthetic_gap_rows: gapRows.length,
+				complete_3min_buckets: completeBuckets,
+				incomplete_3min_buckets: incompleteBuckets,
+				derived_rows_stored: derived.length,
+				pending_closed_period:
+					sourceMeta?.pending_closed_period ?? false,
+				layer: "analysis_normalized",
+			};
+
+			await this.ctx.storage.put(
+				normalizedMetaKey("3min"),
+				meta,
+			);
+
+			return {
+				status: "ok",
+				symbol: SYMBOL,
+				timezone: TIMEZONE,
+				interval: "3min",
+				interval_minutes: 3,
+				layer: "analysis_normalized",
+				derived_from: "normalized_1min",
+				source_rows_seen: source.length,
+				source_regular_rows: regularRows.length,
+				source_synthetic_gap_rows: gapRows.length,
+				complete_3min_buckets: completeBuckets,
+				incomplete_3min_buckets: incompleteBuckets,
+				synthetic_gap_rows: gapRows.length,
+				pending_closed_period:
+					meta.pending_closed_period,
+				normalized_rows_stored: derived.length,
+				oldest_datetime: meta.oldest_datetime,
+				latest_datetime: meta.latest_datetime,
+				analysis_performed: false,
+				note:
+					"3min is deterministic OHLC aggregation from complete normalized 1min buckets. Synthetic closure gaps remain standalone and are never folded into normal 3min candles. No FVG, liquidity, sweep, mitigation, or structure analysis is performed.",
+			};
+		} catch (error) {
+			return {
+				status: "error",
+				interval: "3min",
 				error:
 					error instanceof Error
 						? error.message
