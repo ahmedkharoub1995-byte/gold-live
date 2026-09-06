@@ -11,6 +11,7 @@ const MAX_STORED_CANDLES = 180;
 
 type LiveEnv = {
 	TWELVEDATA_API_KEY: string;
+	HISTORICAL_WORKER_URL: string;
 	Chat: DurableObjectNamespace;
 };
 
@@ -216,6 +217,79 @@ export class Chat extends DurableObject<LiveEnv> {
 			});
 		}
 
+		if (url.pathname === "/historical") {
+			const interval = url.searchParams.get("interval") ?? "1h";
+			const before = url.searchParams.get("before");
+
+			let outputsize = Number(
+				url.searchParams.get("outputsize") ?? 10,
+			);
+
+			if (!Number.isInteger(outputsize) || outputsize < 1) {
+				outputsize = 10;
+			}
+
+			outputsize = Math.min(outputsize, 1150);
+
+			if (!this.env.HISTORICAL_WORKER_URL) {
+				return json(
+					{
+						status: "error",
+						error: "HISTORICAL_WORKER_URL is missing",
+					},
+					500,
+				);
+			}
+
+			try {
+				const upstream = new URL(
+					this.env.HISTORICAL_WORKER_URL,
+				);
+
+				upstream.searchParams.set("symbol", SYMBOL);
+				upstream.searchParams.set("interval", interval);
+				upstream.searchParams.set(
+					"outputsize",
+					String(outputsize),
+				);
+				upstream.searchParams.set("timezone", TIMEZONE);
+
+				if (before) {
+					upstream.searchParams.set("before", before);
+				}
+
+				const response = await fetch(upstream.toString(), {
+					headers: {
+						Accept: "application/json",
+					},
+				});
+
+				const body = await response.text();
+
+				return new Response(body, {
+					status: response.status,
+					headers: {
+						"Content-Type":
+							response.headers.get("Content-Type") ??
+							"application/json; charset=utf-8",
+						"Access-Control-Allow-Origin": "*",
+						"Cache-Control": "no-store",
+					},
+				});
+			} catch (error) {
+				return json(
+					{
+						status: "error",
+						error:
+							error instanceof Error
+								? error.message
+								: String(error),
+					},
+					502,
+				);
+			}
+		}
+
 		if (
 			url.pathname === "/state" ||
 			url.pathname === "/health"
@@ -237,12 +311,17 @@ export class Chat extends DurableObject<LiveEnv> {
 				state: "/state",
 				health: "/health",
 				candles: "/candles?limit=10",
+				historical:
+					"/historical?interval=1h&outputsize=10",
 			},
 
 			data_policy: {
 				live_ticks: "provisional",
 				historical_rest: "authoritative",
 			},
+
+			historical_worker_configured:
+				Boolean(this.env.HISTORICAL_WORKER_URL),
 		});
 	}
 
