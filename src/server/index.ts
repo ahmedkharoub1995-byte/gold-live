@@ -88,12 +88,16 @@ type NormalizedCandle = {
 	status: "OPEN" | "CLOSED";
 	source:
 		| "historical_rest"
-		| "synthetic_gap"
+		| "historical_rest_gap_adjusted"
 		| "derived_1min"
 		| "derived_1h_gap_aware";
 	provisional: false;
 	confirmed: true;
+	// Kept for response compatibility. Under the current project rule
+	// no standalone synthetic gap rows are ever created.
 	synthetic_gap: boolean;
+	// True when this real candle contains the closure/reopen price gap.
+	gap_adjusted: boolean;
 	stored_at_ms: number;
 };
 
@@ -106,7 +110,9 @@ type NormalizedMeta = {
 	raw_rows_seen: number;
 	valid_raw_rows: number;
 	filtered_closed_rows: number;
-	synthetic_gap_rows: number;
+	gap_adjusted_rows: number;
+	// Compatibility field: must always be zero.
+	synthetic_gap_rows: 0;
 	pending_closed_period: boolean;
 	layer: "analysis_normalized";
 };
@@ -120,9 +126,11 @@ type Derived3MinMeta = {
 	source_interval: "1min";
 	source_rows_seen: number;
 	source_regular_rows: number;
+	source_gap_adjusted_rows: number;
 	source_synthetic_gap_rows: number;
 	complete_3min_buckets: number;
 	incomplete_3min_buckets: number;
+	gap_containing_3min_buckets: number;
 	derived_rows_stored: number;
 	pending_closed_period: boolean;
 	layer: "analysis_normalized";
@@ -137,6 +145,7 @@ type Derived4HMeta = {
 	source_interval: "1h";
 	source_rows_seen: number;
 	source_regular_rows: number;
+	source_gap_adjusted_rows: number;
 	source_synthetic_gap_rows: number;
 	complete_4h_buckets: number;
 	incomplete_4h_buckets: number;
@@ -203,6 +212,7 @@ type ProvisionalCandle = {
 	source: "websocket_ticks";
 	provisional: true;
 	confirmed: false;
+	gap_adjusted: boolean;
 };
 
 function json(data: unknown, status = 200) {
@@ -371,13 +381,6 @@ function fourHourBucketStart(datetime: string) {
 	);
 }
 
-function fourHourGapBucketStart(gap: NormalizedCandle) {
-	// Daily gaps close at 01:00 of the same day, while the weekend gap
-	// closes at 01:00 Monday. For 4H, the gap belongs to the 00:00-04:00
-	// candle of the REOPEN day, never to a standalone closure candle.
-	return fourHourBucketStart(gap.expected_close_time);
-}
-
 function cairoDayOfWeek(datetime: string) {
 	const parts = parseCairoDatetimeParts(datetime);
 	if (!parts) return null;
@@ -456,14 +459,43 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			if (saved) {
 				this.enabled = saved.enabled ?? true;
-				this.lastPrice = saved.lastPrice ?? null;
-				this.lastTickMs = saved.lastTickMs ?? null;
 				this.tickCount = saved.tickCount ?? 0;
 				this.reconnectCount = saved.reconnectCount ?? 0;
-				this.currentCandle = saved.currentCandle ?? null;
-				this.candles = saved.candles ?? [];
 				this.lastError = saved.lastError ?? null;
 				this.subscribeStatus = saved.subscribeStatus ?? null;
+
+				// Remove any live candles produced by older versions during
+				// a known closed-market period. They must never enter analysis.
+				this.candles = (saved.candles ?? [])
+					.filter(
+						(candle) =>
+							!isClosedMarketCairoDatetime(
+								candle.datetime,
+							),
+					)
+					.map((candle) => ({
+						...candle,
+						gap_adjusted: candle.gap_adjusted ?? false,
+					}));
+
+				const restoredCurrent = saved.currentCandle ?? null;
+				this.currentCandle =
+					restoredCurrent &&
+					!isClosedMarketCairoDatetime(restoredCurrent.datetime)
+						? {
+							...restoredCurrent,
+							gap_adjusted:
+								restoredCurrent.gap_adjusted ?? false,
+						}
+						: null;
+
+				const lastValidLive =
+					this.currentCandle ??
+					this.candles[this.candles.length - 1] ??
+					null;
+
+				this.lastPrice = lastValidLive?.close ?? null;
+				this.lastTickMs = lastValidLive?.last_tick_ms ?? null;
 			}
 		});
 	}
@@ -539,7 +571,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				confirmed: false,
 
 				note:
-					"Tick-built candles are provisional. REST historical candles are authoritative.",
+					"Tick-built candles are provisional. Closed-market ticks are excluded. On reopening, the first real candle opens at the previous valid close. REST historical candles remain authoritative.",
 
 				closed_candles: this.candles.slice(-limit),
 
@@ -701,9 +733,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				results.push(await this.deriveThreeMinuteFromOneMinute());
 
 				// 4h is derived from normalized 1h so closure rows are never
-				// imported from native 4h. The 00:00-04:00 candle absorbs the
-				// deterministic closure gap instead of creating a standalone
-				// gap candle on the 4h layer.
+				// imported from native 4h. There are no standalone gap rows;
+				// the first real reopening candle is anchored to the previous close.
 				results.push(await this.deriveFourHourFromOneHour());
 
 				return json({
@@ -753,7 +784,7 @@ export class Chat extends DurableObject<LiveEnv> {
 							"4h",
 						],
 						note:
-							"3min is derived deterministically from normalized 1min. 4h is derived gap-aware from normalized 1h. Daily, weekly, and monthly normalization remain deferred.",
+							"3min is derived deterministically from normalized 1min. 4h is derived gap-aware from normalized 1h. Closure gaps are contained in the first real reopening candle; no standalone gap rows are created. Daily, weekly, and monthly normalization remain deferred.",
 					},
 					400,
 				);
@@ -837,6 +868,7 @@ export class Chat extends DurableObject<LiveEnv> {
 					"status",
 					"source",
 					"synthetic_gap",
+					"gap_adjusted",
 				],
 				candles: candles.map((c) => [
 					c.datetime,
@@ -851,6 +883,7 @@ export class Chat extends DurableObject<LiveEnv> {
 					),
 					c.source,
 					c.synthetic_gap,
+					c.gap_adjusted ?? false,
 				]),
 			});
 		}
@@ -896,7 +929,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				timezone: TIMEZONE,
 				storage_layer: "raw_rest_persistent",
 				note:
-					"Normalized layers are maintained separately from raw REST. 3min is derived from normalized 1min; 4h is derived gap-aware from normalized 1h.",
+					"Normalized layers are maintained separately from raw REST. Closed-period rows are removed and reopening gaps are contained inside the first real candle after reopening. 3min is derived from normalized 1min; 4h is derived gap-aware from normalized 1h.",
 				frames,
 			});
 		}
@@ -1024,11 +1057,11 @@ export class Chat extends DurableObject<LiveEnv> {
 			},
 
 			data_policy: {
-				live_ticks: "provisional",
+				live_ticks: "provisional; closed-market ticks excluded; reopening candle gap-adjusted",
 				historical_rest: "authoritative",
 				persistent_storage: "raw REST candles by timeframe",
 				normalized_storage:
-					"session-filtered candles + synthetic gap candles; no market-analysis logic",
+					"session-filtered candles with reopening gaps absorbed into the first real candle; no standalone gap rows and no market-analysis logic",
 				analysis:
 					"ChatGPT only — Worker does not detect FVG, liquidity, sweeps, mitigation, or market structure",
 			},
@@ -1203,25 +1236,50 @@ export class Chat extends DurableObject<LiveEnv> {
 		const tickMs =
 			normalizeTimestamp(data.timestamp);
 
-		this.processTick(price, tickMs);
+		await this.processTick(price, tickMs);
 	}
 
-	private processTick(price: number, tickMs: number) {
+	private async processTick(price: number, tickMs: number) {
 		const bucket = minuteStart(tickMs);
+		const bucketDatetime = cairoTime(bucket);
+
+		// Provider snapshots/ticks inside the declared closed-market
+		// windows are invalid for analysis and are ignored completely.
+		if (isClosedMarketCairoDatetime(bucketDatetime)) {
+			return;
+		}
 
 		this.lastPrice = price;
 		this.lastTickMs = tickMs;
 		this.tickCount++;
 
 		if (!this.currentCandle) {
+			const previousMinuteWasClosed =
+				isClosedMarketCairoDatetime(
+					cairoTime(bucket - 60_000),
+				);
+
+			let anchoredOpen: number | null = null;
+
+			if (previousMinuteWasClosed) {
+				anchoredOpen =
+					await this.latestNormalizedOneMinuteClose();
+			}
+
 			this.currentCandle =
-				this.createCandle(bucket, price, tickMs);
+				this.createCandle(
+					bucket,
+					price,
+					tickMs,
+					anchoredOpen,
+					anchoredOpen !== null,
+				);
 
 			this.ctx.waitUntil(this.persist());
 			return;
 		}
 
-		// نفس شمعة الدقيقة
+		// Same provisional minute candle.
 		if (bucket === this.currentCandle.start_ms) {
 			this.currentCandle.high =
 				Math.max(this.currentCandle.high, price);
@@ -1237,12 +1295,21 @@ export class Chat extends DurableObject<LiveEnv> {
 			return;
 		}
 
-		// Tick قديم خارج الترتيب
+		// Old/out-of-order tick.
 		if (bucket < this.currentCandle.start_ms) {
 			return;
 		}
 
-		// قفل الشمعة المؤقتة القديمة
+		const previousMinuteWasClosed =
+			isClosedMarketCairoDatetime(
+				cairoTime(bucket - 60_000),
+			);
+
+		const previousValidClose =
+			this.currentCandle.close;
+
+		// Close the previous provisional real candle. Missing/closed
+		// minutes are never fabricated as candles in between.
 		this.candles.push({
 			...this.currentCandle,
 		});
@@ -1253,23 +1320,47 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 
 		this.currentCandle =
-			this.createCandle(bucket, price, tickMs);
+			this.createCandle(
+				bucket,
+				price,
+				tickMs,
+				previousMinuteWasClosed
+					? previousValidClose
+					: null,
+				previousMinuteWasClosed,
+			);
 
 		this.ctx.waitUntil(this.persist());
+	}
+
+	private async latestNormalizedOneMinuteClose() {
+		const latest =
+			await this.ctx.storage.list<NormalizedCandle>({
+				prefix: normalizedPrefix("1min"),
+				reverse: true,
+				limit: 1,
+			});
+
+		const candle = Array.from(latest.values())[0] ?? null;
+		return candle?.close ?? null;
 	}
 
 	private createCandle(
 		startMs: number,
 		price: number,
 		tickMs: number,
+		openOverride: number | null = null,
+		gapAdjusted = false,
 	): ProvisionalCandle {
+		const open = openOverride ?? price;
+
 		return {
 			start_ms: startMs,
 			datetime: cairoTime(startMs),
 
-			open: price,
-			high: price,
-			low: price,
+			open,
+			high: Math.max(open, price),
+			low: Math.min(open, price),
 			close: price,
 
 			tick_count: 1,
@@ -1281,6 +1372,7 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			provisional: true,
 			confirmed: false,
+			gap_adjusted: gapAdjusted,
 		};
 	}
 
@@ -1752,12 +1844,11 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			const normalized: NormalizedCandle[] = [];
 			let filteredClosedRows = 0;
-			let syntheticGapRows = 0;
+			let gapAdjustedRows = 0;
 			let pendingClosedPeriod = false;
 
 			let lastValid: StoredHistoricalCandle | null = null;
-			let gapOpen: {
-				start_datetime: string;
+			let pendingGap: {
 				previous_close: number;
 			} | null = null;
 
@@ -1768,13 +1859,10 @@ export class Chat extends DurableObject<LiveEnv> {
 				if (closedMarket) {
 					filteredClosedRows++;
 
-					if (lastValid && !gapOpen) {
-						gapOpen = {
-							start_datetime:
-								addMinutesToCairoDatetime(
-									lastValid.datetime,
-									durationMinutes,
-								),
+					// Remember only the price before the closure. We never
+					// create a candle for the closed period itself.
+					if (lastValid && !pendingGap) {
+						pendingGap = {
 							previous_close: lastValid.close,
 						};
 					}
@@ -1782,39 +1870,25 @@ export class Chat extends DurableObject<LiveEnv> {
 					continue;
 				}
 
-				if (gapOpen) {
-					const gapClose = candle.open;
-					const gapExpectedClose = candle.datetime;
+				const gapAdjusted = pendingGap !== null;
+				const normalizedOpen = gapAdjusted
+					? pendingGap!.previous_close
+					: candle.open;
 
-					normalized.push({
-						timeframe: interval,
-						datetime: gapOpen.start_datetime,
-						open_time: gapOpen.start_datetime,
-						expected_close_time: gapExpectedClose,
-						open: gapOpen.previous_close,
-						high: Math.max(
-							gapOpen.previous_close,
-							gapClose,
-						),
-						low: Math.min(
-							gapOpen.previous_close,
-							gapClose,
-						),
-						close: gapClose,
-						status:
-							statusFromExpectedClose(
-								gapExpectedClose,
-							),
-						source: "synthetic_gap",
-						provisional: false,
-						confirmed: true,
-						synthetic_gap: true,
-						stored_at_ms: Date.now(),
-					});
-
-					syntheticGapRows++;
-					gapOpen = null;
-				}
+				// The reopening candle contains the whole movement from the
+				// previous valid close to the provider's reopening prices.
+				// Therefore its O/H/L/C remains a real candle, with O anchored
+				// to the previous close and the range expanded if necessary.
+				const normalizedHigh = Math.max(
+					candle.high,
+					candle.open,
+					normalizedOpen,
+				);
+				const normalizedLow = Math.min(
+					candle.low,
+					candle.open,
+					normalizedOpen,
+				);
 
 				const expectedCloseTime =
 					addMinutesToCairoDatetime(
@@ -1827,29 +1901,38 @@ export class Chat extends DurableObject<LiveEnv> {
 					datetime: candle.datetime,
 					open_time: candle.datetime,
 					expected_close_time: expectedCloseTime,
-					open: candle.open,
-					high: candle.high,
-					low: candle.low,
+					open: normalizedOpen,
+					high: normalizedHigh,
+					low: normalizedLow,
 					close: candle.close,
 					status:
 						statusFromExpectedClose(
 							expectedCloseTime,
 						),
-					source: "historical_rest",
+					source: gapAdjusted
+						? "historical_rest_gap_adjusted"
+						: "historical_rest",
 					provisional: false,
 					confirmed: true,
 					synthetic_gap: false,
+					gap_adjusted: gapAdjusted,
 					stored_at_ms: Date.now(),
 				});
+
+				if (gapAdjusted) {
+					gapAdjustedRows++;
+					pendingGap = null;
+				}
 
 				lastValid = candle;
 			}
 
-			if (gapOpen) {
+			if (pendingGap) {
 				pendingClosedPeriod = true;
 			}
 
-			// Rebuild only this normalized timeframe.
+			// Rebuild only this normalized timeframe. This also removes any
+			// legacy standalone synthetic-gap rows left by older versions.
 			while (true) {
 				const oldPage =
 					await this.ctx.storage.list<NormalizedCandle>({
@@ -1911,7 +1994,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				valid_raw_rows:
 					raw.length - filteredClosedRows,
 				filtered_closed_rows: filteredClosedRows,
-				synthetic_gap_rows: syntheticGapRows,
+				gap_adjusted_rows: gapAdjustedRows,
+				synthetic_gap_rows: 0,
 				pending_closed_period: pendingClosedPeriod,
 				layer: "analysis_normalized",
 			};
@@ -1932,14 +2016,15 @@ export class Chat extends DurableObject<LiveEnv> {
 				pagination_complete: true,
 				valid_raw_rows: meta.valid_raw_rows,
 				filtered_closed_rows: filteredClosedRows,
-				synthetic_gap_rows: syntheticGapRows,
+				gap_adjusted_rows: gapAdjustedRows,
+				synthetic_gap_rows: 0,
 				pending_closed_period: pendingClosedPeriod,
 				normalized_rows_stored: normalized.length,
 				oldest_datetime: meta.oldest_datetime,
 				latest_datetime: meta.latest_datetime,
 				analysis_performed: false,
 				note:
-					"Worker only filters closed-market rows, inserts synthetic gap candles, and adds candle timing/status metadata. FVG, liquidity, sweeps, mitigation, and structure remain ChatGPT-only.",
+					"Closed-market rows are removed. No standalone gap candle is created. The first real candle after a closure opens at the previous valid close and contains the reopening price gap in its own range. No FVG, liquidity, sweep, mitigation, or structure analysis is performed.",
 			};
 		} catch (error) {
 			return {
@@ -1993,17 +2078,28 @@ export class Chat extends DurableObject<LiveEnv> {
 				};
 			}
 
+			const legacySyntheticRows = source.filter(
+				(c) => c.synthetic_gap === true,
+			);
+
+			if (legacySyntheticRows.length > 0) {
+				return {
+					status: "error",
+					interval: "3min",
+					error:
+						"Legacy standalone synthetic-gap rows detected in normalized 1min. Run /normalize?interval=1min first, or use /normalize?interval=all.",
+				};
+			}
+
 			const sourceMeta =
 				(await this.ctx.storage.get<NormalizedMeta>(
 					normalizedMetaKey("1min"),
 				)) ?? null;
 
-			const regularRows = source.filter(
-				(c) => !c.synthetic_gap,
-			);
-			const gapRows = source.filter(
-				(c) => c.synthetic_gap,
-			);
+			const regularRows = source;
+			const sourceGapAdjustedRows = source.filter(
+				(c) => c.gap_adjusted === true,
+			).length;
 
 			const buckets = new Map<string, NormalizedCandle[]>();
 
@@ -2023,6 +2119,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			const derived: NormalizedCandle[] = [];
 			let completeBuckets = 0;
 			let incompleteBuckets = 0;
+			let gapContainingBuckets = 0;
 
 			for (const [bucketStart, rows] of buckets.entries()) {
 				rows.sort((a, b) =>
@@ -2051,6 +2148,13 @@ export class Chat extends DurableObject<LiveEnv> {
 
 				const expectedCloseTime =
 					addMinutesToCairoDatetime(bucketStart, 3);
+				const gapAdjusted = rows.some(
+					(c) => c.gap_adjusted === true,
+				);
+
+				if (gapAdjusted) {
+					gapContainingBuckets++;
+				}
 
 				derived.push({
 					timeframe: "3min",
@@ -2069,41 +2173,19 @@ export class Chat extends DurableObject<LiveEnv> {
 					provisional: false,
 					confirmed: true,
 					synthetic_gap: false,
+					gap_adjusted: gapAdjusted,
 					stored_at_ms: Date.now(),
 				});
 
 				completeBuckets++;
 			}
 
-			// A completed closure remains its own standalone synthetic
-			// gap candle and is never folded into a normal 3min bucket.
-			for (const gap of gapRows) {
-				derived.push({
-					timeframe: "3min",
-					datetime: gap.datetime,
-					open_time: gap.open_time,
-					expected_close_time: gap.expected_close_time,
-					open: gap.open,
-					high: gap.high,
-					low: gap.low,
-					close: gap.close,
-					status:
-						statusFromExpectedClose(
-							gap.expected_close_time,
-						),
-					source: "synthetic_gap",
-					provisional: false,
-					confirmed: true,
-					synthetic_gap: true,
-					stored_at_ms: Date.now(),
-				});
-			}
-
 			derived.sort((a, b) =>
 				a.datetime.localeCompare(b.datetime),
 			);
 
-			// Rebuild only the derived 3min layer.
+			// Rebuild only the derived 3min layer, removing any legacy
+			// standalone synthetic-gap rows from older versions.
 			while (true) {
 				const oldPage =
 					await this.ctx.storage.list<NormalizedCandle>({
@@ -2164,9 +2246,11 @@ export class Chat extends DurableObject<LiveEnv> {
 				source_interval: "1min",
 				source_rows_seen: source.length,
 				source_regular_rows: regularRows.length,
-				source_synthetic_gap_rows: gapRows.length,
+				source_gap_adjusted_rows: sourceGapAdjustedRows,
+				source_synthetic_gap_rows: 0,
 				complete_3min_buckets: completeBuckets,
 				incomplete_3min_buckets: incompleteBuckets,
+				gap_containing_3min_buckets: gapContainingBuckets,
 				derived_rows_stored: derived.length,
 				pending_closed_period:
 					sourceMeta?.pending_closed_period ?? false,
@@ -2188,10 +2272,12 @@ export class Chat extends DurableObject<LiveEnv> {
 				derived_from: "normalized_1min",
 				source_rows_seen: source.length,
 				source_regular_rows: regularRows.length,
-				source_synthetic_gap_rows: gapRows.length,
+				source_gap_adjusted_rows: sourceGapAdjustedRows,
+				source_synthetic_gap_rows: 0,
 				complete_3min_buckets: completeBuckets,
 				incomplete_3min_buckets: incompleteBuckets,
-				synthetic_gap_rows: gapRows.length,
+				gap_containing_3min_buckets: gapContainingBuckets,
+				synthetic_gap_rows: 0,
 				pending_closed_period:
 					meta.pending_closed_period,
 				normalized_rows_stored: derived.length,
@@ -2199,7 +2285,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				latest_datetime: meta.latest_datetime,
 				analysis_performed: false,
 				note:
-					"3min is deterministic OHLC aggregation from complete normalized 1min buckets. Synthetic closure gaps remain standalone and are never folded into normal 3min candles. No FVG, liquidity, sweep, mitigation, or structure analysis is performed.",
+					"3min is deterministic OHLC aggregation from normalized 1min. Reopening gaps are already contained inside the first real 1min candle, so no standalone gap row is created or carried into 3min. No market-analysis logic is performed.",
 			};
 		} catch (error) {
 			return {
@@ -2212,7 +2298,6 @@ export class Chat extends DurableObject<LiveEnv> {
 			};
 		}
 	}
-
 
 	private async deriveFourHourFromOneHour() {
 		try {
@@ -2254,22 +2339,30 @@ export class Chat extends DurableObject<LiveEnv> {
 				};
 			}
 
+			const legacySyntheticRows = source.filter(
+				(c) => c.synthetic_gap === true,
+			);
+
+			if (legacySyntheticRows.length > 0) {
+				return {
+					status: "error",
+					interval: "4h",
+					error:
+						"Legacy standalone synthetic-gap rows detected in normalized 1h. Run /normalize?interval=1h first, or use /normalize?interval=all.",
+				};
+			}
+
 			const sourceMeta =
 				(await this.ctx.storage.get<NormalizedMeta>(
 					normalizedMetaKey("1h"),
 				)) ?? null;
 
-			const regularRows = source.filter(
-				(c) => !c.synthetic_gap,
-			);
-			const gapRows = source.filter(
-				(c) => c.synthetic_gap,
-			);
+			const regularRows = source;
+			const sourceGapAdjustedRows = source.filter(
+				(c) => c.gap_adjusted === true,
+			).length;
 
-			const regularBuckets =
-				new Map<string, NormalizedCandle[]>();
-			const gapBuckets =
-				new Map<string, NormalizedCandle[]>();
+			const buckets = new Map<string, NormalizedCandle[]>();
 
 			for (const candle of regularRows) {
 				const bucketStart =
@@ -2279,38 +2372,19 @@ export class Chat extends DurableObject<LiveEnv> {
 					continue;
 				}
 
-				const bucket =
-					regularBuckets.get(bucketStart) ?? [];
+				const bucket = buckets.get(bucketStart) ?? [];
 				bucket.push(candle);
-				regularBuckets.set(bucketStart, bucket);
+				buckets.set(bucketStart, bucket);
 			}
-
-			for (const gap of gapRows) {
-				const bucketStart =
-					fourHourGapBucketStart(gap);
-
-				if (!bucketStart) {
-					continue;
-				}
-
-				const bucket =
-					gapBuckets.get(bucketStart) ?? [];
-				bucket.push(gap);
-				gapBuckets.set(bucketStart, bucket);
-			}
-
-			const bucketStarts = new Set<string>([
-				...regularBuckets.keys(),
-				...gapBuckets.keys(),
-			]);
 
 			const derived: NormalizedCandle[] = [];
 			let completeBuckets = 0;
 			let incompleteBuckets = 0;
 			let gapAbsorbedBuckets = 0;
-			let absorbedSyntheticGapRows = 0;
 
-			for (const bucketStart of Array.from(bucketStarts).sort()) {
+			for (const [bucketStart, rowsInput] of Array.from(
+				buckets.entries(),
+			).sort(([a], [b]) => a.localeCompare(b))) {
 				const parts =
 					parseCairoDatetimeParts(bucketStart);
 
@@ -2319,101 +2393,61 @@ export class Chat extends DurableObject<LiveEnv> {
 					continue;
 				}
 
-				const regular =
-					(regularBuckets.get(bucketStart) ?? [])
-						.slice()
-						.sort((a, b) =>
-							a.datetime.localeCompare(b.datetime),
-						);
+				const rows = rowsInput
+					.slice()
+					.sort((a, b) =>
+						a.datetime.localeCompare(b.datetime),
+					);
 
-				const gaps =
-					(gapBuckets.get(bucketStart) ?? [])
-						.slice()
-						.sort((a, b) =>
-							a.expected_close_time.localeCompare(
-								b.expected_close_time,
-							),
-						);
-
-				const expectedCloseTime =
-					addMinutesToCairoDatetime(bucketStart, 240);
-
-				let components: NormalizedCandle[] = [];
-				let open: number;
-				let close: number;
-				let bucketContainsGap = false;
+				let expectedDatetimes: string[];
 
 				if (parts.hour === 0) {
-					// Project rule for the 00:00-04:00 4H candle:
-					// - Do not import raw closed-market rows.
-					// - Absorb exactly one deterministic closure gap.
-					// - Then use the valid 01:00, 02:00, 03:00 1H rows.
-					// - On Monday, the weekend gap is mapped to Monday
-					//   00:00-04:00 using its reopen time (Monday 01:00).
-					const expectedRegular = [
+					// Project rule: the 00:00-04:00 4H bucket has no
+					// standalone closure candle. Its first real 1H row is
+					// 01:00 and that row already opens at the previous valid
+					// close, so the daily/weekend gap lives inside this 4H candle.
+					expectedDatetimes = [
 						addMinutesToCairoDatetime(bucketStart, 60),
 						addMinutesToCairoDatetime(bucketStart, 120),
 						addMinutesToCairoDatetime(bucketStart, 180),
 					];
-
-					const actualRegular =
-						regular.map((c) => c.datetime);
-
-					const matchingGap = gaps.find(
-						(gap) =>
-							gap.expected_close_time ===
-							addMinutesToCairoDatetime(
-								bucketStart,
-								60,
-							),
-					);
-
-					const complete =
-						Boolean(matchingGap) &&
-						regular.length === 3 &&
-						expectedRegular.every(
-							(value, index) =>
-								actualRegular[index] === value,
-						);
-
-					if (!complete || !matchingGap) {
-						incompleteBuckets++;
-						continue;
-					}
-
-					components = [matchingGap, ...regular];
-					open = matchingGap.open;
-					close = regular[2].close;
-					bucketContainsGap = true;
-					gapAbsorbedBuckets++;
-					absorbedSyntheticGapRows++;
 				} else {
-					const expectedRegular = [
+					expectedDatetimes = [
 						bucketStart,
 						addMinutesToCairoDatetime(bucketStart, 60),
 						addMinutesToCairoDatetime(bucketStart, 120),
 						addMinutesToCairoDatetime(bucketStart, 180),
 					];
+				}
 
-					const actualRegular =
-						regular.map((c) => c.datetime);
+				const actualDatetimes = rows.map((c) => c.datetime);
+				const complete =
+					rows.length === expectedDatetimes.length &&
+					expectedDatetimes.every(
+						(value, index) =>
+							actualDatetimes[index] === value,
+					);
 
-					const complete =
-						regular.length === 4 &&
-						gaps.length === 0 &&
-						expectedRegular.every(
-							(value, index) =>
-								actualRegular[index] === value,
-						);
+				if (!complete) {
+					incompleteBuckets++;
+					continue;
+				}
 
-					if (!complete) {
-						incompleteBuckets++;
-						continue;
-					}
+				// The midnight 4H candle is only considered fully gap-aware
+				// when its 01:00 source row was anchored to the previous close.
+				if (parts.hour === 0 && rows[0].gap_adjusted !== true) {
+					incompleteBuckets++;
+					continue;
+				}
 
-					components = regular;
-					open = regular[0].open;
-					close = regular[3].close;
+				const expectedCloseTime =
+					addMinutesToCairoDatetime(bucketStart, 240);
+				const gapAdjusted = rows.some(
+					(c) => c.gap_adjusted === true,
+				);
+
+				if (gapAdjusted) {
+					gapAbsorbedBuckets++;
 				}
 
 				derived.push({
@@ -2421,14 +2455,10 @@ export class Chat extends DurableObject<LiveEnv> {
 					datetime: bucketStart,
 					open_time: bucketStart,
 					expected_close_time: expectedCloseTime,
-					open,
-					high: Math.max(
-						...components.map((c) => c.high),
-					),
-					low: Math.min(
-						...components.map((c) => c.low),
-					),
-					close,
+					open: rows[0].open,
+					high: Math.max(...rows.map((c) => c.high)),
+					low: Math.min(...rows.map((c) => c.low)),
+					close: rows[rows.length - 1].close,
 					status:
 						statusFromExpectedClose(
 							expectedCloseTime,
@@ -2436,22 +2466,16 @@ export class Chat extends DurableObject<LiveEnv> {
 					source: "derived_1h_gap_aware",
 					provisional: false,
 					confirmed: true,
-					// This is a real 4H candle that CONTAINS the
-					// deterministic closure gap; it is not a standalone
-					// synthetic-gap row.
 					synthetic_gap: false,
+					gap_adjusted: gapAdjusted,
 					stored_at_ms: Date.now(),
 				});
 
 				completeBuckets++;
-
-				// bucketContainsGap is intentionally counted in metadata
-				// only. The candle remains synthetic_gap=false because the
-				// entire 4H candle itself is not synthetic.
-				void bucketContainsGap;
 			}
 
-			// Rebuild only the derived 4h normalized layer.
+			// Rebuild only the derived 4h normalized layer, removing any
+			// legacy standalone-gap representation from older versions.
 			while (true) {
 				const oldPage =
 					await this.ctx.storage.list<NormalizedCandle>({
@@ -2512,12 +2536,12 @@ export class Chat extends DurableObject<LiveEnv> {
 				source_interval: "1h",
 				source_rows_seen: source.length,
 				source_regular_rows: regularRows.length,
-				source_synthetic_gap_rows: gapRows.length,
+				source_gap_adjusted_rows: sourceGapAdjustedRows,
+				source_synthetic_gap_rows: 0,
 				complete_4h_buckets: completeBuckets,
 				incomplete_4h_buckets: incompleteBuckets,
 				gap_absorbed_buckets: gapAbsorbedBuckets,
-				absorbed_synthetic_gap_rows:
-					absorbedSyntheticGapRows,
+				absorbed_synthetic_gap_rows: 0,
 				derived_rows_stored: derived.length,
 				pending_closed_period:
 					sourceMeta?.pending_closed_period ?? false,
@@ -2538,15 +2562,15 @@ export class Chat extends DurableObject<LiveEnv> {
 				layer: "analysis_normalized",
 				derived_from: "normalized_1h",
 				gap_policy:
-					"00:00-04:00 absorbs the deterministic daily/weekend closure gap; no standalone 4h gap candle is created.",
+					"No standalone gap candle. The first real candle after a closure opens at the previous valid close; the 00:00-04:00 4H bucket then contains that adjusted 01:00 candle plus 02:00 and 03:00.",
 				source_rows_seen: source.length,
 				source_regular_rows: regularRows.length,
-				source_synthetic_gap_rows: gapRows.length,
+				source_gap_adjusted_rows: sourceGapAdjustedRows,
+				source_synthetic_gap_rows: 0,
 				complete_4h_buckets: completeBuckets,
 				incomplete_4h_buckets: incompleteBuckets,
 				gap_absorbed_buckets: gapAbsorbedBuckets,
-				absorbed_synthetic_gap_rows:
-					absorbedSyntheticGapRows,
+				absorbed_synthetic_gap_rows: 0,
 				pending_closed_period:
 					meta.pending_closed_period,
 				normalized_rows_stored: derived.length,
@@ -2554,7 +2578,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				latest_datetime: meta.latest_datetime,
 				analysis_performed: false,
 				note:
-					"4h is deterministic OHLC aggregation from normalized 1h. The 00:00-04:00 candle absorbs the closure gap plus valid 01:00, 02:00, and 03:00 rows; on Monday the weekend gap is mapped to Monday 00:00-04:00. Raw closed-market rows are never used, and no market-analysis logic is performed.",
+					"4h is deterministic OHLC aggregation from normalized 1h. The closure/reopen gap is part of the first real reopening candle, never a separate row. The Monday 00:00-04:00 candle uses the same rule with the weekend gap. No market-analysis logic is performed.",
 			};
 		} catch (error) {
 			return {
