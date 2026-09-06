@@ -37,7 +37,8 @@ type NormalizedRestInterval =
 
 type AnalysisNormalizedInterval =
 	| NormalizedRestInterval
-	| "3min";
+	| "3min"
+	| "4h";
 
 const NORMALIZED_INTERVAL_MINUTES: Record<
 	NormalizedRestInterval,
@@ -88,7 +89,8 @@ type NormalizedCandle = {
 	source:
 		| "historical_rest"
 		| "synthetic_gap"
-		| "derived_1min";
+		| "derived_1min"
+		| "derived_1h_gap_aware";
 	provisional: false;
 	confirmed: true;
 	synthetic_gap: boolean;
@@ -121,6 +123,25 @@ type Derived3MinMeta = {
 	source_synthetic_gap_rows: number;
 	complete_3min_buckets: number;
 	incomplete_3min_buckets: number;
+	derived_rows_stored: number;
+	pending_closed_period: boolean;
+	layer: "analysis_normalized";
+};
+
+type Derived4HMeta = {
+	timeframe: "4h";
+	last_normalized_ms: number;
+	last_normalized_time: string;
+	latest_datetime: string | null;
+	oldest_datetime: string | null;
+	source_interval: "1h";
+	source_rows_seen: number;
+	source_regular_rows: number;
+	source_synthetic_gap_rows: number;
+	complete_4h_buckets: number;
+	incomplete_4h_buckets: number;
+	gap_absorbed_buckets: number;
+	absorbed_synthetic_gap_rows: number;
 	derived_rows_stored: number;
 	pending_closed_period: boolean;
 	layer: "analysis_normalized";
@@ -246,6 +267,7 @@ function isAnalysisNormalizedInterval(
 ): value is AnalysisNormalizedInterval {
 	return (
 		value === "3min" ||
+		value === "4h" ||
 		isNormalizedRestInterval(value)
 	);
 }
@@ -334,6 +356,26 @@ function threeMinuteBucketStart(datetime: string) {
 		`${parts.year}-${pad(parts.month)}-${pad(parts.day)} ` +
 		`${pad(parts.hour)}:${pad(bucketMinute)}:00`
 	);
+}
+
+function fourHourBucketStart(datetime: string) {
+	const parts = parseCairoDatetimeParts(datetime);
+	if (!parts) return null;
+
+	const bucketHour = Math.floor(parts.hour / 4) * 4;
+	const pad = (n: number) => String(n).padStart(2, "0");
+
+	return (
+		`${parts.year}-${pad(parts.month)}-${pad(parts.day)} ` +
+		`${pad(bucketHour)}:00:00`
+	);
+}
+
+function fourHourGapBucketStart(gap: NormalizedCandle) {
+	// Daily gaps close at 01:00 of the same day, while the weekend gap
+	// closes at 01:00 Monday. For 4H, the gap belongs to the 00:00-04:00
+	// candle of the REOPEN day, never to a standalone closure candle.
+	return fourHourBucketStart(gap.expected_close_time);
 }
 
 function cairoDayOfWeek(datetime: string) {
@@ -658,6 +700,12 @@ export class Chat extends DurableObject<LiveEnv> {
 				// normalized layer has been rebuilt.
 				results.push(await this.deriveThreeMinuteFromOneMinute());
 
+				// 4h is derived from normalized 1h so closure rows are never
+				// imported from native 4h. The 00:00-04:00 candle absorbs the
+				// deterministic closure gap instead of creating a standalone
+				// gap candle on the 4h layer.
+				results.push(await this.deriveFourHourFromOneHour());
+
 				return json({
 					status: "ok",
 					mode: "all",
@@ -679,12 +727,22 @@ export class Chat extends DurableObject<LiveEnv> {
 				);
 			}
 
+			if (requestedInterval === "4h") {
+				const result =
+					await this.deriveFourHourFromOneHour();
+
+				return json(
+					result,
+					result.status === "ok" ? 200 : 500,
+				);
+			}
+
 			if (!isNormalizedRestInterval(requestedInterval)) {
 				return json(
 					{
 						status: "error",
 						error:
-							"Normalization supports 1min, 3min, 5min, 15min, 30min, and 1h.",
+							"Normalization supports 1min, 3min, 5min, 15min, 30min, 1h, and 4h.",
 						supported_intervals: [
 							"1min",
 							"3min",
@@ -692,9 +750,10 @@ export class Chat extends DurableObject<LiveEnv> {
 							"15min",
 							"30min",
 							"1h",
+							"4h",
 						],
 						note:
-							"3min is derived deterministically from normalized 1min. 4h and higher remain deferred until native candle boundary behavior is validated.",
+							"3min is derived deterministically from normalized 1min. 4h is derived gap-aware from normalized 1h. Daily, weekly, and monthly normalization remain deferred.",
 					},
 					400,
 				);
@@ -718,7 +777,7 @@ export class Chat extends DurableObject<LiveEnv> {
 					{
 						status: "error",
 						error:
-							"Normalized storage supports 1min, 3min, 5min, 15min, 30min, and 1h.",
+							"Normalized storage supports 1min, 3min, 5min, 15min, 30min, 1h, and 4h.",
 						supported_intervals: [
 							"1min",
 							"3min",
@@ -726,6 +785,7 @@ export class Chat extends DurableObject<LiveEnv> {
 							"15min",
 							"30min",
 							"1h",
+							"4h",
 						],
 					},
 					400,
@@ -753,7 +813,7 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			const meta =
 				(await this.ctx.storage.get<
-					NormalizedMeta | Derived3MinMeta
+					NormalizedMeta | Derived3MinMeta | Derived4HMeta
 				>(
 					normalizedMetaKey(interval),
 				)) ?? null;
@@ -836,7 +896,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				timezone: TIMEZONE,
 				storage_layer: "raw_rest_persistent",
 				note:
-					"3min storage is not created yet. Session filtering, synthetic gap candles, and derived timeframe logic will be added in the next stage.",
+					"Normalized layers are maintained separately from raw REST. 3min is derived from normalized 1min; 4h is derived gap-aware from normalized 1h.",
 				frames,
 			});
 		}
@@ -948,12 +1008,16 @@ export class Chat extends DurableObject<LiveEnv> {
 					"/normalize?interval=1min",
 				derive_3min:
 					"/normalize?interval=3min",
+				derive_4h:
+					"/normalize?interval=4h",
 				normalize_all_supported:
 					"/normalize?interval=all",
 				normalized_data:
 					"/normalized-data?interval=1min&limit=100",
 				normalized_3min:
 					"/normalized-data?interval=3min&limit=100",
+				normalized_4h:
+					"/normalized-data?interval=4h&limit=100",
 				storage_state: "/storage-state",
 				purge:
 					"/purge?interval=1min&confirm=yes",
@@ -2141,6 +2205,361 @@ export class Chat extends DurableObject<LiveEnv> {
 			return {
 				status: "error",
 				interval: "3min",
+				error:
+					error instanceof Error
+						? error.message
+						: String(error),
+			};
+		}
+	}
+
+
+	private async deriveFourHourFromOneHour() {
+		try {
+			const source: NormalizedCandle[] = [];
+			let startAfter: string | undefined;
+
+			while (true) {
+				const page =
+					await this.ctx.storage.list<NormalizedCandle>({
+						prefix: normalizedPrefix("1h"),
+						limit: 1000,
+						...(startAfter ? { startAfter } : {}),
+					});
+
+				if (page.size === 0) {
+					break;
+				}
+
+				source.push(...page.values());
+
+				if (page.size < 1000) {
+					break;
+				}
+
+				const keys = Array.from(page.keys()) as string[];
+				startAfter = keys[keys.length - 1];
+			}
+
+			source.sort((a, b) =>
+				a.datetime.localeCompare(b.datetime),
+			);
+
+			if (source.length === 0) {
+				return {
+					status: "error",
+					interval: "4h",
+					error:
+						"No normalized 1h candles found. Run /normalize?interval=1h first.",
+				};
+			}
+
+			const sourceMeta =
+				(await this.ctx.storage.get<NormalizedMeta>(
+					normalizedMetaKey("1h"),
+				)) ?? null;
+
+			const regularRows = source.filter(
+				(c) => !c.synthetic_gap,
+			);
+			const gapRows = source.filter(
+				(c) => c.synthetic_gap,
+			);
+
+			const regularBuckets =
+				new Map<string, NormalizedCandle[]>();
+			const gapBuckets =
+				new Map<string, NormalizedCandle[]>();
+
+			for (const candle of regularRows) {
+				const bucketStart =
+					fourHourBucketStart(candle.datetime);
+
+				if (!bucketStart) {
+					continue;
+				}
+
+				const bucket =
+					regularBuckets.get(bucketStart) ?? [];
+				bucket.push(candle);
+				regularBuckets.set(bucketStart, bucket);
+			}
+
+			for (const gap of gapRows) {
+				const bucketStart =
+					fourHourGapBucketStart(gap);
+
+				if (!bucketStart) {
+					continue;
+				}
+
+				const bucket =
+					gapBuckets.get(bucketStart) ?? [];
+				bucket.push(gap);
+				gapBuckets.set(bucketStart, bucket);
+			}
+
+			const bucketStarts = new Set<string>([
+				...regularBuckets.keys(),
+				...gapBuckets.keys(),
+			]);
+
+			const derived: NormalizedCandle[] = [];
+			let completeBuckets = 0;
+			let incompleteBuckets = 0;
+			let gapAbsorbedBuckets = 0;
+			let absorbedSyntheticGapRows = 0;
+
+			for (const bucketStart of Array.from(bucketStarts).sort()) {
+				const parts =
+					parseCairoDatetimeParts(bucketStart);
+
+				if (!parts) {
+					incompleteBuckets++;
+					continue;
+				}
+
+				const regular =
+					(regularBuckets.get(bucketStart) ?? [])
+						.slice()
+						.sort((a, b) =>
+							a.datetime.localeCompare(b.datetime),
+						);
+
+				const gaps =
+					(gapBuckets.get(bucketStart) ?? [])
+						.slice()
+						.sort((a, b) =>
+							a.expected_close_time.localeCompare(
+								b.expected_close_time,
+							),
+						);
+
+				const expectedCloseTime =
+					addMinutesToCairoDatetime(bucketStart, 240);
+
+				let components: NormalizedCandle[] = [];
+				let open: number;
+				let close: number;
+				let bucketContainsGap = false;
+
+				if (parts.hour === 0) {
+					// Project rule for the 00:00-04:00 4H candle:
+					// - Do not import raw closed-market rows.
+					// - Absorb exactly one deterministic closure gap.
+					// - Then use the valid 01:00, 02:00, 03:00 1H rows.
+					// - On Monday, the weekend gap is mapped to Monday
+					//   00:00-04:00 using its reopen time (Monday 01:00).
+					const expectedRegular = [
+						addMinutesToCairoDatetime(bucketStart, 60),
+						addMinutesToCairoDatetime(bucketStart, 120),
+						addMinutesToCairoDatetime(bucketStart, 180),
+					];
+
+					const actualRegular =
+						regular.map((c) => c.datetime);
+
+					const matchingGap = gaps.find(
+						(gap) =>
+							gap.expected_close_time ===
+							addMinutesToCairoDatetime(
+								bucketStart,
+								60,
+							),
+					);
+
+					const complete =
+						Boolean(matchingGap) &&
+						regular.length === 3 &&
+						expectedRegular.every(
+							(value, index) =>
+								actualRegular[index] === value,
+						);
+
+					if (!complete || !matchingGap) {
+						incompleteBuckets++;
+						continue;
+					}
+
+					components = [matchingGap, ...regular];
+					open = matchingGap.open;
+					close = regular[2].close;
+					bucketContainsGap = true;
+					gapAbsorbedBuckets++;
+					absorbedSyntheticGapRows++;
+				} else {
+					const expectedRegular = [
+						bucketStart,
+						addMinutesToCairoDatetime(bucketStart, 60),
+						addMinutesToCairoDatetime(bucketStart, 120),
+						addMinutesToCairoDatetime(bucketStart, 180),
+					];
+
+					const actualRegular =
+						regular.map((c) => c.datetime);
+
+					const complete =
+						regular.length === 4 &&
+						gaps.length === 0 &&
+						expectedRegular.every(
+							(value, index) =>
+								actualRegular[index] === value,
+						);
+
+					if (!complete) {
+						incompleteBuckets++;
+						continue;
+					}
+
+					components = regular;
+					open = regular[0].open;
+					close = regular[3].close;
+				}
+
+				derived.push({
+					timeframe: "4h",
+					datetime: bucketStart,
+					open_time: bucketStart,
+					expected_close_time: expectedCloseTime,
+					open,
+					high: Math.max(
+						...components.map((c) => c.high),
+					),
+					low: Math.min(
+						...components.map((c) => c.low),
+					),
+					close,
+					status:
+						statusFromExpectedClose(
+							expectedCloseTime,
+						),
+					source: "derived_1h_gap_aware",
+					provisional: false,
+					confirmed: true,
+					// This is a real 4H candle that CONTAINS the
+					// deterministic closure gap; it is not a standalone
+					// synthetic-gap row.
+					synthetic_gap: false,
+					stored_at_ms: Date.now(),
+				});
+
+				completeBuckets++;
+
+				// bucketContainsGap is intentionally counted in metadata
+				// only. The candle remains synthetic_gap=false because the
+				// entire 4H candle itself is not synthetic.
+				void bucketContainsGap;
+			}
+
+			// Rebuild only the derived 4h normalized layer.
+			while (true) {
+				const oldPage =
+					await this.ctx.storage.list<NormalizedCandle>({
+						prefix: normalizedPrefix("4h"),
+						limit: 500,
+					});
+
+				if (oldPage.size === 0) {
+					break;
+				}
+
+				const keys = Array.from(oldPage.keys());
+
+				for (let i = 0; i < keys.length; i += 100) {
+					await this.ctx.storage.delete(
+						keys.slice(i, i + 100),
+					);
+				}
+			}
+
+			for (let i = 0; i < derived.length; i += 100) {
+				const batch = derived.slice(i, i + 100);
+				const entries: Record<
+					string,
+					NormalizedCandle
+				> = {};
+
+				for (const candle of batch) {
+					entries[
+						normalizedCandleKey(
+							"4h",
+							candle.datetime,
+						)
+					] = candle;
+				}
+
+				await this.ctx.storage.put(entries);
+			}
+
+			const datetimes = derived
+				.map((c) => c.datetime)
+				.sort();
+
+			const now = Date.now();
+
+			const meta: Derived4HMeta = {
+				timeframe: "4h",
+				last_normalized_ms: now,
+				last_normalized_time: cairoTime(now),
+				latest_datetime:
+					datetimes.length > 0
+						? datetimes[datetimes.length - 1]
+						: null,
+				oldest_datetime:
+					datetimes.length > 0
+						? datetimes[0]
+						: null,
+				source_interval: "1h",
+				source_rows_seen: source.length,
+				source_regular_rows: regularRows.length,
+				source_synthetic_gap_rows: gapRows.length,
+				complete_4h_buckets: completeBuckets,
+				incomplete_4h_buckets: incompleteBuckets,
+				gap_absorbed_buckets: gapAbsorbedBuckets,
+				absorbed_synthetic_gap_rows:
+					absorbedSyntheticGapRows,
+				derived_rows_stored: derived.length,
+				pending_closed_period:
+					sourceMeta?.pending_closed_period ?? false,
+				layer: "analysis_normalized",
+			};
+
+			await this.ctx.storage.put(
+				normalizedMetaKey("4h"),
+				meta,
+			);
+
+			return {
+				status: "ok",
+				symbol: SYMBOL,
+				timezone: TIMEZONE,
+				interval: "4h",
+				interval_minutes: 240,
+				layer: "analysis_normalized",
+				derived_from: "normalized_1h",
+				gap_policy:
+					"00:00-04:00 absorbs the deterministic daily/weekend closure gap; no standalone 4h gap candle is created.",
+				source_rows_seen: source.length,
+				source_regular_rows: regularRows.length,
+				source_synthetic_gap_rows: gapRows.length,
+				complete_4h_buckets: completeBuckets,
+				incomplete_4h_buckets: incompleteBuckets,
+				gap_absorbed_buckets: gapAbsorbedBuckets,
+				absorbed_synthetic_gap_rows:
+					absorbedSyntheticGapRows,
+				pending_closed_period:
+					meta.pending_closed_period,
+				normalized_rows_stored: derived.length,
+				oldest_datetime: meta.oldest_datetime,
+				latest_datetime: meta.latest_datetime,
+				analysis_performed: false,
+				note:
+					"4h is deterministic OHLC aggregation from normalized 1h. The 00:00-04:00 candle absorbs the closure gap plus valid 01:00, 02:00, and 03:00 rows; on Monday the weekend gap is mapped to Monday 00:00-04:00. Raw closed-market rows are never used, and no market-analysis logic is performed.",
+			};
+		} catch (error) {
+			return {
+				status: "error",
+				interval: "4h",
 				error:
 					error instanceof Error
 						? error.message
