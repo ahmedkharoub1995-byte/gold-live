@@ -24,6 +24,28 @@ const REST_INTERVALS = [
 
 type RestInterval = (typeof REST_INTERVALS)[number];
 
+const NORMALIZED_REST_INTERVALS = [
+	"1min",
+	"5min",
+	"15min",
+	"30min",
+	"1h",
+] as const;
+
+type NormalizedRestInterval =
+	(typeof NORMALIZED_REST_INTERVALS)[number];
+
+const NORMALIZED_INTERVAL_MINUTES: Record<
+	NormalizedRestInterval,
+	number
+> = {
+	"1min": 1,
+	"5min": 5,
+	"15min": 15,
+	"30min": 30,
+	"1h": 60,
+};
+
 type StoredHistoricalCandle = {
 	timeframe: RestInterval;
 	datetime: string;
@@ -49,8 +71,8 @@ type HistoricalMeta = {
 	source: "historical_rest";
 };
 
-type NormalizedOneHourCandle = {
-	timeframe: "1h";
+type NormalizedCandle = {
+	timeframe: NormalizedRestInterval;
 	datetime: string;
 	open_time: string;
 	expected_close_time: string;
@@ -67,7 +89,7 @@ type NormalizedOneHourCandle = {
 };
 
 type NormalizedMeta = {
-	timeframe: "1h";
+	timeframe: NormalizedRestInterval;
 	last_normalized_ms: number;
 	last_normalized_time: string;
 	latest_datetime: string | null;
@@ -201,17 +223,39 @@ function historicalMetaKey(interval: RestInterval) {
 	return `meta:${interval}`;
 }
 
-function normalizedOneHourKey(datetime: string) {
-	return `norm:1h:${datetime}`;
+function isNormalizedRestInterval(
+	value: string,
+): value is NormalizedRestInterval {
+	return (
+		NORMALIZED_REST_INTERVALS as readonly string[]
+	).includes(value);
 }
 
-function normalizedOneHourPrefix() {
-	return "norm:1h:";
+function normalizedCandleKey(
+	interval: NormalizedRestInterval,
+	datetime: string,
+) {
+	return `norm:${interval}:${datetime}`;
 }
 
-function normalizedOneHourMetaKey() {
-	return "normmeta:1h";
+function normalizedPrefix(
+	interval: NormalizedRestInterval,
+) {
+	return `norm:${interval}:`;
 }
+
+function normalizedMetaKey(
+	interval: NormalizedRestInterval,
+) {
+	return `normmeta:${interval}`;
+}
+
+function normalizedIntervalMinutes(
+	interval: NormalizedRestInterval,
+) {
+	return NORMALIZED_INTERVAL_MINUTES[interval];
+}
+
 
 function parseCairoDatetimeParts(datetime: string) {
 	const match = datetime.match(
@@ -250,7 +294,10 @@ function cairoDatetimeToMs(datetime: string) {
 	);
 }
 
-function addMinutesToCairoDatetime(datetime: string, minutes: number) {
+function addMinutesToCairoDatetime(
+	datetime: string,
+	minutes: number,
+) {
 	const ms = cairoDatetimeToMs(datetime);
 	if (ms === null) return datetime;
 	return cairoTime(ms + minutes * 60_000);
@@ -260,7 +307,6 @@ function cairoDayOfWeek(datetime: string) {
 	const parts = parseCairoDatetimeParts(datetime);
 	if (!parts) return null;
 
-	// Day-of-week from the local Cairo calendar date itself.
 	return new Date(
 		Date.UTC(parts.year, parts.month - 1, parts.day),
 	).getUTCDay();
@@ -563,23 +609,46 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 
 		if (url.pathname === "/normalize") {
-			const interval =
+			const requestedInterval =
 				url.searchParams.get("interval") ?? "1h";
 
-			if (interval !== "1h") {
+			if (requestedInterval === "all") {
+				const results = [];
+
+				for (const interval of NORMALIZED_REST_INTERVALS) {
+					results.push(
+						await this.normalizeStoredInterval(interval),
+					);
+				}
+
+				return json({
+					status: "ok",
+					mode: "all",
+					symbol: SYMBOL,
+					timezone: TIMEZONE,
+					layer: "analysis_normalized",
+					results,
+					analysis_performed: false,
+				});
+			}
+
+			if (!isNormalizedRestInterval(requestedInterval)) {
 				return json(
 					{
 						status: "error",
 						error:
-							"Stage 1 normalization currently supports 1h only.",
+							"Normalization currently supports 1min, 5min, 15min, 30min, and 1h only.",
+						supported_intervals:
+							NORMALIZED_REST_INTERVALS,
 						note:
-							"Other timeframes will use the same managed-data rules after the 1h session/gap engine is verified.",
+							"4h and higher are intentionally deferred until native candle boundary behavior is validated.",
 					},
 					400,
 				);
 			}
 
-			const result = await this.normalizeStoredOneHour();
+			const result =
+				await this.normalizeStoredInterval(requestedInterval);
 
 			return json(
 				result,
@@ -591,12 +660,14 @@ export class Chat extends DurableObject<LiveEnv> {
 			const interval =
 				url.searchParams.get("interval") ?? "1h";
 
-			if (interval !== "1h") {
+			if (!isNormalizedRestInterval(interval)) {
 				return json(
 					{
 						status: "error",
 						error:
-							"Stage 1 normalized storage currently supports 1h only.",
+							"Normalized storage currently supports 1min, 5min, 15min, 30min, and 1h only.",
+						supported_intervals:
+							NORMALIZED_REST_INTERVALS,
 					},
 					400,
 				);
@@ -611,8 +682,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			limit = Math.min(limit, 1000);
 
 			const rows =
-				await this.ctx.storage.list<NormalizedOneHourCandle>({
-					prefix: normalizedOneHourPrefix(),
+				await this.ctx.storage.list<NormalizedCandle>({
+					prefix: normalizedPrefix(interval),
 					reverse: true,
 					limit,
 				});
@@ -623,14 +694,14 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			const meta =
 				(await this.ctx.storage.get<NormalizedMeta>(
-					normalizedOneHourMetaKey(),
+					normalizedMetaKey(interval),
 				)) ?? null;
 
 			return json({
 				status: "ok",
 				symbol: SYMBOL,
 				timezone: TIMEZONE,
-				interval: "1h",
+				interval,
 				layer: "analysis_normalized",
 				count: candles.length,
 				meta,
@@ -654,7 +725,9 @@ export class Chat extends DurableObject<LiveEnv> {
 					c.high,
 					c.low,
 					c.close,
-					statusFromExpectedClose(c.expected_close_time),
+					statusFromExpectedClose(
+						c.expected_close_time,
+					),
 					c.source,
 					c.synthetic_gap,
 				]),
@@ -810,10 +883,12 @@ export class Chat extends DurableObject<LiveEnv> {
 					"/sync?interval=all&outputsize=100",
 				data:
 					"/data?interval=1h&limit=100",
-				normalize:
-					"/normalize?interval=1h",
+ 				normalize:
+					"/normalize?interval=1min",
+				normalize_all_supported:
+					"/normalize?interval=all",
 				normalized_data:
-					"/normalized-data?interval=1h&limit=100",
+					"/normalized-data?interval=1min&limit=100",
 				storage_state: "/storage-state",
 				purge:
 					"/purge?interval=1min&confirm=yes",
@@ -829,8 +904,8 @@ export class Chat extends DurableObject<LiveEnv> {
 					"ChatGPT only — Worker does not detect FVG, liquidity, sweeps, mitigation, or market structure",
 			},
 
-			historical_worker_configured:
-				Boolean(HISTORICAL_WORKER_URL),
+			historical_source:
+				"direct_twelve_data_rest",
 		});
 	}
 
@@ -1287,10 +1362,45 @@ export class Chat extends DurableObject<LiveEnv> {
 				historicalMetaKey(interval),
 			);
 
+			let deletedNormalized = 0;
+
+			if (isNormalizedRestInterval(interval)) {
+				while (true) {
+					const normalizedPage =
+						await this.ctx.storage.list<NormalizedCandle>({
+							prefix: normalizedPrefix(interval),
+							limit: 500,
+						});
+
+					if (normalizedPage.size === 0) {
+						break;
+					}
+
+					const normalizedKeys =
+						Array.from(normalizedPage.keys());
+
+					for (
+						let i = 0;
+						i < normalizedKeys.length;
+						i += 100
+					) {
+						const batch =
+							normalizedKeys.slice(i, i + 100);
+						await this.ctx.storage.delete(batch);
+						deletedNormalized += batch.length;
+					}
+
+					await this.ctx.storage.delete(
+						normalizedMetaKey(interval),
+					);
+				}
+			}
+
 			return {
 				status: "ok",
 				interval,
 				deleted_candles: deleted,
+				deleted_normalized_candles: deletedNormalized,
 				meta_deleted: true,
 				storage_layer: "raw_rest_persistent",
 			};
@@ -1466,7 +1576,9 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 	}
 
-	private async normalizeStoredOneHour() {
+	private async normalizeStoredInterval(
+		interval: NormalizedRestInterval,
+	) {
 		try {
 			const raw: StoredHistoricalCandle[] = [];
 			let startAfter: string | undefined;
@@ -1474,7 +1586,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			while (true) {
 				const page =
 					await this.ctx.storage.list<StoredHistoricalCandle>({
-						prefix: historicalPrefix("1h"),
+						prefix: historicalPrefix(interval),
 						limit: 1000,
 						...(startAfter ? { startAfter } : {}),
 					});
@@ -1489,7 +1601,7 @@ export class Chat extends DurableObject<LiveEnv> {
 					break;
 				}
 
-				const keys = Array.from(page.keys());
+				const keys = Array.from(page.keys()) as string[];
 				startAfter = keys[keys.length - 1];
 			}
 
@@ -1500,11 +1612,16 @@ export class Chat extends DurableObject<LiveEnv> {
 			if (raw.length === 0) {
 				return {
 					status: "error",
-					error: "No stored 1h raw REST candles found",
+					interval,
+					error:
+						`No stored ${interval} raw REST candles found`,
 				};
 			}
 
-			const normalized: NormalizedOneHourCandle[] = [];
+			const durationMinutes =
+				normalizedIntervalMinutes(interval);
+
+			const normalized: NormalizedCandle[] = [];
 			let filteredClosedRows = 0;
 			let syntheticGapRows = 0;
 			let pendingClosedPeriod = false;
@@ -1527,7 +1644,7 @@ export class Chat extends DurableObject<LiveEnv> {
 							start_datetime:
 								addMinutesToCairoDatetime(
 									lastValid.datetime,
-									60,
+									durationMinutes,
 								),
 							previous_close: lastValid.close,
 						};
@@ -1541,7 +1658,7 @@ export class Chat extends DurableObject<LiveEnv> {
 					const gapExpectedClose = candle.datetime;
 
 					normalized.push({
-						timeframe: "1h",
+						timeframe: interval,
 						datetime: gapOpen.start_datetime,
 						open_time: gapOpen.start_datetime,
 						expected_close_time: gapExpectedClose,
@@ -1573,11 +1690,11 @@ export class Chat extends DurableObject<LiveEnv> {
 				const expectedCloseTime =
 					addMinutesToCairoDatetime(
 						candle.datetime,
-						60,
+						durationMinutes,
 					);
 
 				normalized.push({
-					timeframe: "1h",
+					timeframe: interval,
 					datetime: candle.datetime,
 					open_time: candle.datetime,
 					expected_close_time: expectedCloseTime,
@@ -1603,29 +1720,38 @@ export class Chat extends DurableObject<LiveEnv> {
 				pendingClosedPeriod = true;
 			}
 
-			// Clear previous normalized 1h layer, then rebuild it.
-			const oldNormalized =
-				await this.ctx.storage.list<NormalizedOneHourCandle>({
-					prefix: normalizedOneHourPrefix(),
-					limit: 1000,
-				});
+			// Rebuild only this normalized timeframe.
+			while (true) {
+				const oldPage =
+					await this.ctx.storage.list<NormalizedCandle>({
+						prefix: normalizedPrefix(interval),
+						limit: 500,
+					});
 
-			if (oldNormalized.size > 0) {
-				await this.ctx.storage.delete(
-					Array.from(oldNormalized.keys()),
-				);
+				if (oldPage.size === 0) {
+					break;
+				}
+
+				const keys = Array.from(oldPage.keys());
+
+				for (let i = 0; i < keys.length; i += 100) {
+					await this.ctx.storage.delete(
+						keys.slice(i, i + 100),
+					);
+				}
 			}
 
 			for (let i = 0; i < normalized.length; i += 100) {
 				const batch = normalized.slice(i, i + 100);
 				const entries: Record<
 					string,
-					NormalizedOneHourCandle
+					NormalizedCandle
 				> = {};
 
 				for (const candle of batch) {
 					entries[
-						normalizedOneHourKey(
+						normalizedCandleKey(
+							interval,
 							candle.datetime,
 						)
 					] = candle;
@@ -1641,7 +1767,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			const now = Date.now();
 
 			const meta: NormalizedMeta = {
-				timeframe: "1h",
+				timeframe: interval,
 				last_normalized_ms: now,
 				last_normalized_time: cairoTime(now),
 				latest_datetime:
@@ -1662,7 +1788,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			};
 
 			await this.ctx.storage.put(
-				normalizedOneHourMetaKey(),
+				normalizedMetaKey(interval),
 				meta,
 			);
 
@@ -1670,7 +1796,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				status: "ok",
 				symbol: SYMBOL,
 				timezone: TIMEZONE,
-				interval: "1h",
+				interval,
+				interval_minutes: durationMinutes,
 				layer: "analysis_normalized",
 				raw_rows_seen: raw.length,
 				pagination_complete: true,
@@ -1688,6 +1815,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		} catch (error) {
 			return {
 				status: "error",
+				interval,
 				error:
 					error instanceof Error
 						? error.message
