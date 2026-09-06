@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
+const HISTORICAL_WORKER_URL = "https://odd-tree-f8e9.ahmed-kharoub1995.workers.dev";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -11,7 +12,6 @@ const MAX_STORED_CANDLES = 180;
 
 type LiveEnv = {
 	TWELVEDATA_API_KEY: string;
-	HISTORICAL_WORKER_URL: string;
 	Chat: DurableObjectNamespace;
 };
 
@@ -231,7 +231,7 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			outputsize = Math.min(outputsize, 1150);
 
-			if (!this.env.HISTORICAL_WORKER_URL) {
+			if (!HISTORICAL_WORKER_URL) {
 				return json(
 					{
 						status: "error",
@@ -243,7 +243,7 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			try {
 				const upstream = new URL(
-					this.env.HISTORICAL_WORKER_URL,
+					HISTORICAL_WORKER_URL,
 				);
 
 				upstream.searchParams.set("symbol", SYMBOL);
@@ -321,7 +321,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			},
 
 			historical_worker_configured:
-				Boolean(this.env.HISTORICAL_WORKER_URL),
+				Boolean(HISTORICAL_WORKER_URL),
 		});
 	}
 
