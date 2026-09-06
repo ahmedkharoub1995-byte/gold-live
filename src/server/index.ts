@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
+const BUILD_VERSION = "v9-daily-native-repair-2026-09-06";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -18,6 +19,12 @@ const AUTO_RATE_WINDOW_MS = 60_000;
 const AUTO_MAX_REQUESTS_PER_WINDOW = 7;
 const AUTO_INCREMENTAL_OUTPUTSIZE = 12;
 const AUTO_BOOTSTRAP_OUTPUTSIZE = 1150;
+
+// One-time normalized-storage migration marker.
+// v8 fixes Twelve Data date-only higher-timeframe timestamps and
+// correct weekly close boundaries without refetching raw history.
+const STORAGE_MIGRATION_KEY = "storage_migration_version";
+const STORAGE_MIGRATION_VERSION = "v9-higher-native-date-repair";
 
 const REST_INTERVALS = [
 	"1min",
@@ -363,13 +370,16 @@ function normalizedIntervalMinutes(
 
 
 function parseCairoDatetimeParts(datetime: string) {
+	// Twelve Data returns intraday rows as "YYYY-MM-DD HH:mm:ss"
+	// but higher native intervals may arrive as date-only "YYYY-MM-DD".
+	// Canonicalize date-only higher-timeframe rows to midnight Cairo.
 	const match = datetime.match(
-		/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/,
+		/^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2}):(\d{2}))?$/,
 	);
 
 	if (!match) return null;
 
-	const [, y, mo, d, h, mi, s] = match;
+	const [, y, mo, d, h = "00", mi = "00", s = "00"] = match;
 
 	return {
 		year: Number(y),
@@ -379,6 +389,15 @@ function parseCairoDatetimeParts(datetime: string) {
 		minute: Number(mi),
 		second: Number(s),
 	};
+}
+
+function canonicalCairoDatetime(datetime: string) {
+	const parts = parseCairoDatetimeParts(datetime);
+	if (!parts) return null;
+	return (
+		`${parts.year}-${pad2(parts.month)}-${pad2(parts.day)} ` +
+		`${pad2(parts.hour)}:${pad2(parts.minute)}:${pad2(parts.second)}`
+	);
 }
 
 function cairoDatetimeToMs(datetime: string) {
@@ -512,7 +531,9 @@ function expectedCloseForHigherInterval(
 	}
 
 	if (interval === "1week") {
-		return addMinutesToCairoDatetime(datetime, 7 * 24 * 60);
+		// Weekly candles are keyed from Monday 00:00 Cairo but the trading
+		// week is complete at Saturday 00:00, when the weekend closure begins.
+		return addMinutesToCairoDatetime(datetime, 5 * 24 * 60);
 	}
 
 	return nextMonthStartCairo(datetime);
@@ -1009,6 +1030,10 @@ export class Chat extends DurableObject<LiveEnv> {
 			const interval =
 				url.searchParams.get("interval") ?? "1h";
 
+			if (isHigherNativeInterval(interval)) {
+				await this.ensureStorageMigration();
+			}
+
 			if (!isAnalysisNormalizedInterval(interval)) {
 				return json(
 					{
@@ -1204,6 +1229,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 
 		if (url.pathname === "/system-check") {
+			const migration = await this.ensureStorageMigration();
 			const frames = [];
 			for (const interval of [
 				"1min",
@@ -1239,10 +1265,12 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			return json({
 				status: "ok",
+				build_version: BUILD_VERSION,
 				symbol: SYMBOL,
 				timezone: TIMEZONE,
 				market_closed: isClosedMarketCairoDatetime(cairoTime(Date.now())),
 				last_live_price: this.lastPrice,
+				storage_migration: migration,
 				auto: this.publicAutoState(),
 				frames,
 				analysis_performed: false,
@@ -1380,6 +1408,7 @@ export class Chat extends DurableObject<LiveEnv> {
 
 		return json({
 			status: "ok",
+			build_version: BUILD_VERSION,
 
 			service: "XAU/USD Live Service",
 
@@ -3067,6 +3096,93 @@ export class Chat extends DurableObject<LiveEnv> {
 		);
 	}
 
+	private async ensureStorageMigration() {
+		const current =
+			(await this.ctx.storage.get<string>(STORAGE_MIGRATION_KEY)) ?? null;
+
+		if (current === STORAGE_MIGRATION_VERSION) {
+			return {
+				status: "ok",
+				version: current,
+				migrated: false,
+			};
+		}
+
+		const results: unknown[] = [];
+
+		for (const interval of HIGHER_NATIVE_INTERVALS) {
+			// A previous build may have fetched the higher timeframe but failed
+			// to normalize it because Twelve Data used date-only timestamps.
+			// Prefer the already-stored raw layer; only fetch when that layer
+			// is genuinely missing. Missing required history is an allowed REST
+			// refresh under the project rules.
+			let rawProbe = await this.ctx.storage.list<StoredHistoricalCandle>({
+				prefix: historicalPrefix(interval),
+				reverse: true,
+				limit: 1,
+			});
+
+			let repairedFromRest = false;
+			if (rawProbe.size === 0) {
+				const sync = await this.syncHistoricalInterval(
+					interval,
+					AUTO_BOOTSTRAP_OUTPUTSIZE,
+					null,
+				);
+				results.push({ interval, stage: "raw_repair", result: sync });
+
+				if (sync.status !== "ok") {
+					return {
+						status: "error",
+						version: current,
+						migrated: false,
+						failed_interval: interval,
+						failed_stage: "raw_repair",
+						results,
+					};
+				}
+				repairedFromRest = true;
+				rawProbe = await this.ctx.storage.list<StoredHistoricalCandle>({
+					prefix: historicalPrefix(interval),
+					reverse: true,
+					limit: 1,
+				});
+			}
+
+			const normalized = await this.normalizeHigherNativeInterval(interval);
+			results.push({
+				interval,
+				stage: "normalize",
+				repaired_from_rest: repairedFromRest,
+				raw_present: rawProbe.size > 0,
+				result: normalized,
+			});
+
+			if (normalized.status !== "ok") {
+				return {
+					status: "error",
+					version: current,
+					migrated: false,
+					failed_interval: interval,
+					failed_stage: "normalize",
+					results,
+				};
+			}
+		}
+
+		await this.ctx.storage.put(
+			STORAGE_MIGRATION_KEY,
+			STORAGE_MIGRATION_VERSION,
+		);
+
+		return {
+			status: "ok",
+			version: STORAGE_MIGRATION_VERSION,
+			migrated: true,
+			results,
+		};
+	}
+
 	private publicAutoState() {
 		this.ensureAutoState();
 		const state = this.autoState!;
@@ -3311,6 +3427,11 @@ export class Chat extends DurableObject<LiveEnv> {
 		if (!state.enabled) return;
 
 		state.last_alarm_ms = Date.now();
+
+		// Apply one-time storage migrations automatically after deploy.
+		// This does not consume Twelve Data API credits.
+		await this.ensureStorageMigration();
+
 		this.updateScheduleAndEnqueue(state.last_alarm_ms);
 		await this.persistAutoState();
 
@@ -3550,25 +3671,37 @@ export class Chat extends DurableObject<LiveEnv> {
 			let previous: NormalizedCandle | null = null;
 
 			for (const candle of raw) {
-				if (interval === "1day" && !isTradingDayCairo(candle.datetime)) {
+				const canonicalOpenTime = canonicalCairoDatetime(candle.datetime);
+				if (!canonicalOpenTime) {
+					filteredClosedRows++;
+					continue;
+				}
+
+				if (
+					interval === "1day" &&
+					!isTradingDayCairo(canonicalOpenTime)
+				) {
 					filteredClosedRows++;
 					continue;
 				}
 
 				const expectedCloseTime = expectedCloseForHigherInterval(
 					interval,
-					candle.datetime,
+					canonicalOpenTime,
 				);
 				if (statusFromExpectedClose(expectedCloseTime) === "OPEN") {
 					continue;
 				}
 
+				// Project rule for higher native candles:
+				// the new candle owns any price discontinuity from the previous
+				// confirmed close. No standalone gap candle is ever created.
 				const gapAdjusted = previous !== null;
 				const open = gapAdjusted ? previous!.close : candle.open;
 				const row: NormalizedCandle = {
 					timeframe: interval,
-					datetime: candle.datetime,
-					open_time: candle.datetime,
+					datetime: canonicalOpenTime,
+					open_time: canonicalOpenTime,
 					expected_close_time: expectedCloseTime,
 					open,
 					high: Math.max(candle.high, candle.open, open),
@@ -3890,8 +4023,17 @@ export class Chat extends DurableObject<LiveEnv> {
 	): Promise<NormalizedCandle | null> {
 		const nowMs = Date.now();
 		const nowCairo = cairoTime(nowMs);
+		const marketClosed = isClosedMarketCairoDatetime(nowCairo);
 
-		if (isClosedMarketCairoDatetime(nowCairo)) {
+		// Intraday and Daily must not fabricate a new candle while the market
+		// is closed. Weekly/Monthly, however, may already be active candles
+		// spanning a daily closure; allow them to keep an effective provisional
+		// view from the latest confirmed Daily data until their own close.
+		if (
+			marketClosed &&
+			interval !== "1week" &&
+			interval !== "1month"
+		) {
 			return null;
 		}
 
@@ -3967,6 +4109,19 @@ export class Chat extends DurableObject<LiveEnv> {
 
 		if (interval === "1week") {
 			const bucketStart = weekStartMondayCairo(nowCairo);
+			const expectedClose =
+				addMinutesToCairoDatetime(bucketStart, 5 * 24 * 60);
+
+			// After Saturday 00:00 the trading week is closed; the Worker should
+			// expose the confirmed weekly candle, not a provisional duplicate.
+			const expectedCloseMs = cairoDatetimeToMs(expectedClose);
+			if (
+				expectedCloseMs !== null &&
+				nowMs >= expectedCloseMs
+			) {
+				return null;
+			}
+
 			const rows = await this.getEffectiveDailySeries(
 				bucketStart,
 				nowCairo,
@@ -3974,7 +4129,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			return this.aggregateRows(
 				"1week",
 				bucketStart,
-				addMinutesToCairoDatetime(bucketStart, 7 * 24 * 60),
+				expectedClose,
 				rows,
 				"provisional_1day",
 			);
