@@ -7,8 +7,17 @@ const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
 
-// نخزن آخر 180 شمعة دقيقة مؤقتة = 3 ساعات
-const MAX_STORED_CANDLES = 180;
+// Keep enough provisional 1-minute candles to bridge every 4H refresh window.
+const MAX_STORED_CANDLES = 480;
+
+const AUTO_STATE_KEY = "auto_refresh_state";
+const AUTO_ALARM_MS = 60_000;
+const AUTO_RATE_WINDOW_MS = 60_000;
+// Twelve Data Basic allows 8 API credits/minute. Keep one credit spare
+// for a manual request and process the rest automatically on the next alarm.
+const AUTO_MAX_REQUESTS_PER_WINDOW = 7;
+const AUTO_INCREMENTAL_OUTPUTSIZE = 12;
+const AUTO_BOOTSTRAP_OUTPUTSIZE = 1150;
 
 const REST_INTERVALS = [
 	"1min",
@@ -35,8 +44,21 @@ const NORMALIZED_REST_INTERVALS = [
 type NormalizedRestInterval =
 	(typeof NORMALIZED_REST_INTERVALS)[number];
 
-type AnalysisNormalizedInterval =
+const HIGHER_NATIVE_INTERVALS = [
+	"1day",
+	"1week",
+	"1month",
+] as const;
+
+type HigherNativeInterval =
+	(typeof HIGHER_NATIVE_INTERVALS)[number];
+
+type NativeNormalizedInterval =
 	| NormalizedRestInterval
+	| HigherNativeInterval;
+
+type AnalysisNormalizedInterval =
+	| NativeNormalizedInterval
 	| "3min"
 	| "4h";
 
@@ -86,23 +108,18 @@ type NormalizedCandle = {
 	low: number;
 	close: number;
 	status: "OPEN" | "CLOSED";
-	source:
-		| "historical_rest"
-		| "historical_rest_gap_adjusted"
-		| "derived_1min"
-		| "derived_1h_gap_aware";
-	provisional: false;
-	confirmed: true;
-	// Kept for response compatibility. Under the current project rule
-	// no standalone synthetic gap rows are ever created.
+	source: string;
+	provisional: boolean;
+	confirmed: boolean;
+	// Compatibility field. Standalone gap candles are forbidden.
 	synthetic_gap: boolean;
-	// True when this real candle contains the closure/reopen price gap.
+	// The real reopening candle owns the price discontinuity.
 	gap_adjusted: boolean;
 	stored_at_ms: number;
 };
 
 type NormalizedMeta = {
-	timeframe: NormalizedRestInterval;
+	timeframe: NativeNormalizedInterval;
 	last_normalized_ms: number;
 	last_normalized_time: string;
 	latest_datetime: string | null;
@@ -111,7 +128,6 @@ type NormalizedMeta = {
 	valid_raw_rows: number;
 	filtered_closed_rows: number;
 	gap_adjusted_rows: number;
-	// Compatibility field: must always be zero.
 	synthetic_gap_rows: 0;
 	pending_closed_period: boolean;
 	layer: "analysis_normalized";
@@ -154,6 +170,32 @@ type Derived4HMeta = {
 	derived_rows_stored: number;
 	pending_closed_period: boolean;
 	layer: "analysis_normalized";
+};
+
+type AutoQueueItem = {
+	interval: RestInterval;
+	outputsize: number;
+	reason: string;
+	enqueued_ms: number;
+	attempts: number;
+};
+
+type AutoRefreshState = {
+	enabled: boolean;
+	queue: AutoQueueItem[];
+	last_5m_key: string;
+	last_15m_key: string;
+	last_hour_key: string;
+	last_4h_key: string;
+	last_day_key: string;
+	last_week_close_key: string | null;
+	last_month_key: string;
+	rate_window_start_ms: number;
+	rate_requests: number;
+	last_alarm_ms: number | null;
+	last_success_ms: number | null;
+	last_error: string | null;
+	bootstrap_pending: boolean;
 };
 
 type HistoricalWorkerPayload = {
@@ -272,13 +314,25 @@ function isNormalizedRestInterval(
 	).includes(value);
 }
 
+function isHigherNativeInterval(
+	value: string,
+): value is HigherNativeInterval {
+	return (HIGHER_NATIVE_INTERVALS as readonly string[]).includes(value);
+}
+
+function isNativeNormalizedInterval(
+	value: string,
+): value is NativeNormalizedInterval {
+	return isNormalizedRestInterval(value) || isHigherNativeInterval(value);
+}
+
 function isAnalysisNormalizedInterval(
 	value: string,
 ): value is AnalysisNormalizedInterval {
 	return (
 		value === "3min" ||
 		value === "4h" ||
-		isNormalizedRestInterval(value)
+		isNativeNormalizedInterval(value)
 	);
 }
 
@@ -404,6 +458,106 @@ function isClosedMarketCairoDatetime(datetime: string) {
 	return parts.hour < 1;
 }
 
+function pad2(value: number) {
+	return String(value).padStart(2, "0");
+}
+
+function dayStartCairo(datetime: string) {
+	const parts = parseCairoDatetimeParts(datetime);
+	if (!parts) return datetime;
+	return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)} 00:00:00`;
+}
+
+function intradayBucketStart(datetime: string, minutes: number) {
+	const parts = parseCairoDatetimeParts(datetime);
+	if (!parts) return null;
+
+	if (minutes === 60) {
+		return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)} ${pad2(parts.hour)}:00:00`;
+	}
+
+	const bucketMinute = Math.floor(parts.minute / minutes) * minutes;
+	return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)} ${pad2(parts.hour)}:${pad2(bucketMinute)}:00`;
+}
+
+function weekStartMondayCairo(datetime: string) {
+	const start = dayStartCairo(datetime);
+	const ms = cairoDatetimeToMs(start);
+	const day = cairoDayOfWeek(start);
+	if (ms === null || day === null) return start;
+
+	const daysSinceMonday = (day + 6) % 7;
+	return cairoTime(ms - daysSinceMonday * 24 * 60 * 60 * 1000);
+}
+
+function monthStartCairo(datetime: string) {
+	const parts = parseCairoDatetimeParts(datetime);
+	if (!parts) return datetime;
+	return `${parts.year}-${pad2(parts.month)}-01 00:00:00`;
+}
+
+function nextMonthStartCairo(datetime: string) {
+	const parts = parseCairoDatetimeParts(datetime);
+	if (!parts) return datetime;
+	const next = new Date(Date.UTC(parts.year, parts.month, 1, 0, 0, 0));
+	return `${next.getUTCFullYear()}-${pad2(next.getUTCMonth() + 1)}-01 00:00:00`;
+}
+
+function expectedCloseForHigherInterval(
+	interval: HigherNativeInterval,
+	datetime: string,
+) {
+	if (interval === "1day") {
+		return addMinutesToCairoDatetime(datetime, 24 * 60);
+	}
+
+	if (interval === "1week") {
+		return addMinutesToCairoDatetime(datetime, 7 * 24 * 60);
+	}
+
+	return nextMonthStartCairo(datetime);
+}
+
+function isTradingDayCairo(datetime: string) {
+	const day = cairoDayOfWeek(datetime);
+	return day !== null && day >= 1 && day <= 5;
+}
+
+function hasDeclaredClosureBetween(
+	previousExpectedClose: string,
+	currentOpen: string,
+) {
+	const startMs = cairoDatetimeToMs(previousExpectedClose);
+	const endMs = cairoDatetimeToMs(currentOpen);
+	if (startMs === null || endMs === null || endMs <= startMs) {
+		return false;
+	}
+
+	for (let ms = startMs; ms < endMs; ms += 60_000) {
+		if (isClosedMarketCairoDatetime(cairoTime(ms))) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+function scheduleBucketKey(datetime: string, minutes: number) {
+	return intradayBucketStart(datetime, minutes) ?? datetime;
+}
+
+function fourHourScheduleKey(datetime: string) {
+	return fourHourBucketStart(datetime) ?? datetime;
+}
+
+function dateKey(datetime: string) {
+	return datetime.slice(0, 10);
+}
+
+function monthKey(datetime: string) {
+	return datetime.slice(0, 7);
+}
+
 function statusFromExpectedClose(expectedCloseTime: string) {
 	const closeMs = cairoDatetimeToMs(expectedCloseTime);
 
@@ -440,6 +594,7 @@ export class Chat extends DurableObject<LiveEnv> {
 
 	private lastError: string | null = null;
 	private subscribeStatus: unknown = null;
+	private autoState: AutoRefreshState | null = null;
 
 	constructor(ctx: DurableObjectState, env: LiveEnv) {
 		super(ctx, env);
@@ -496,6 +651,31 @@ export class Chat extends DurableObject<LiveEnv> {
 
 				this.lastPrice = lastValidLive?.close ?? null;
 				this.lastTickMs = lastValidLive?.last_tick_ms ?? null;
+			}
+
+			const now = Date.now();
+			const nowCairo = cairoTime(now);
+			const savedAuto =
+				(await ctx.storage.get<AutoRefreshState>(AUTO_STATE_KEY)) ?? null;
+
+			if (savedAuto) {
+				this.autoState = savedAuto;
+			} else {
+				this.autoState = this.createInitialAutoState(nowCairo, now);
+				this.enqueueAutoIntervals(
+					REST_INTERVALS,
+					AUTO_BOOTSTRAP_OUTPUTSIZE,
+					"bootstrap",
+				);
+				this.autoState.bootstrap_pending = true;
+				await ctx.storage.put(AUTO_STATE_KEY, this.autoState);
+			}
+
+			if (this.autoState.enabled) {
+				const alarm = await ctx.storage.getAlarm();
+				if (alarm === null) {
+					await ctx.storage.setAlarm(now + 1_000);
+				}
 			}
 		});
 	}
@@ -601,26 +781,24 @@ export class Chat extends DurableObject<LiveEnv> {
 			outputsize = Math.min(outputsize, 1150);
 
 			if (requestedInterval === "all") {
-				const results = [];
-
-				for (const interval of REST_INTERVALS) {
-					results.push(
-						await this.syncHistoricalInterval(
-							interval,
-							outputsize,
-							null,
-						),
-					);
-				}
+				this.ensureAutoState();
+				this.enqueueAutoIntervals(
+					REST_INTERVALS,
+					outputsize,
+					"manual_sync_all",
+				);
+				await this.persistAutoState();
+				await this.processAutoQueue();
+				await this.scheduleAutoAlarm();
 
 				return json({
 					status: "ok",
-					mode: "all",
+					mode: "queued_all",
 					symbol: SYMBOL,
 					timezone: TIMEZONE,
 					note:
-						"Persistent raw REST storage only. No FVG, liquidity, sweep, mitigation, or market-structure analysis is performed in the Worker.",
-					results,
+						"All REST intervals were queued and are processed automatically within the Twelve Data rate budget. 3min is derived locally and never requested.",
+					auto: this.publicAutoState(),
 				});
 			}
 
@@ -645,7 +823,23 @@ export class Chat extends DurableObject<LiveEnv> {
 				before,
 			);
 
-			return json(result, result.status === "ok" ? 200 : 502);
+			if (result.status === "ok") {
+				await this.postAutoRefresh({
+					interval: requestedInterval,
+					outputsize,
+					reason: before ? "manual_backfill" : "manual_sync",
+					enqueued_ms: Date.now(),
+					attempts: 0,
+				});
+			}
+
+			return json(
+				{
+					...result,
+					reconciled_normalized_layer: result.status === "ok",
+				},
+				result.status === "ok" ? 200 : 502,
+			);
 		}
 
 		if (url.pathname === "/data") {
@@ -728,14 +922,14 @@ export class Chat extends DurableObject<LiveEnv> {
 					);
 				}
 
-				// 3min is derived only after the authoritative 1min
-				// normalized layer has been rebuilt.
 				results.push(await this.deriveThreeMinuteFromOneMinute());
-
-				// 4h is derived from normalized 1h so closure rows are never
-				// imported from native 4h. There are no standalone gap rows;
-				// the first real reopening candle is anchored to the previous close.
 				results.push(await this.deriveFourHourFromOneHour());
+
+				for (const interval of HIGHER_NATIVE_INTERVALS) {
+					results.push(
+						await this.normalizeHigherNativeInterval(interval),
+					);
+				}
 
 				return json({
 					status: "ok",
@@ -768,12 +962,21 @@ export class Chat extends DurableObject<LiveEnv> {
 				);
 			}
 
+			if (isHigherNativeInterval(requestedInterval)) {
+				const result =
+					await this.normalizeHigherNativeInterval(requestedInterval);
+
+				return json(
+					result,
+					result.status === "ok" ? 200 : 500,
+				);
+			}
+
 			if (!isNormalizedRestInterval(requestedInterval)) {
 				return json(
 					{
 						status: "error",
-						error:
-							"Normalization supports 1min, 3min, 5min, 15min, 30min, 1h, and 4h.",
+						error: "Unsupported normalized interval",
 						supported_intervals: [
 							"1min",
 							"3min",
@@ -782,9 +985,12 @@ export class Chat extends DurableObject<LiveEnv> {
 							"30min",
 							"1h",
 							"4h",
+							"1day",
+							"1week",
+							"1month",
 						],
 						note:
-							"3min is derived deterministically from normalized 1min. 4h is derived gap-aware from normalized 1h. Closure gaps are contained in the first real reopening candle; no standalone gap rows are created. Daily, weekly, and monthly normalization remain deferred.",
+							"No standalone gap candles are created. 3min is derived from 1min. 4h is the gap-aware view derived from normalized 1h. Daily, weekly, and monthly confirmed history remains native Twelve Data REST.",
 					},
 					400,
 				);
@@ -807,8 +1013,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				return json(
 					{
 						status: "error",
-						error:
-							"Normalized storage supports 1min, 3min, 5min, 15min, 30min, 1h, and 4h.",
+						error: "Unsupported normalized interval",
 						supported_intervals: [
 							"1min",
 							"3min",
@@ -817,6 +1022,9 @@ export class Chat extends DurableObject<LiveEnv> {
 							"30min",
 							"1h",
 							"4h",
+							"1day",
+							"1week",
+							"1month",
 						],
 					},
 					400,
@@ -838,9 +1046,29 @@ export class Chat extends DurableObject<LiveEnv> {
 					limit,
 				});
 
-			const candles = Array.from(rows.values()).sort((a, b) =>
+			const confirmed = Array.from(rows.values()).sort((a, b) =>
 				b.datetime.localeCompare(a.datetime),
 			);
+
+			const provisionalTail =
+				await this.buildProvisionalTail(interval);
+			const currentProvisional =
+				provisionalTail.length > 0
+					? provisionalTail[provisionalTail.length - 1]
+					: null;
+
+			const merged = new Map<string, NormalizedCandle>();
+			for (const candle of provisionalTail) {
+				merged.set(candle.datetime, candle);
+			}
+			// Confirmed REST/derived-confirmed history wins on overlap.
+			for (const candle of confirmed) {
+				merged.set(candle.datetime, candle);
+			}
+
+			const candles = Array.from(merged.values())
+				.sort((a, b) => b.datetime.localeCompare(a.datetime))
+				.slice(0, limit);
 
 			const meta =
 				(await this.ctx.storage.get<
@@ -854,8 +1082,16 @@ export class Chat extends DurableObject<LiveEnv> {
 				symbol: SYMBOL,
 				timezone: TIMEZONE,
 				interval,
-				layer: "analysis_normalized",
+				layer: "analysis_normalized_effective",
 				count: candles.length,
+				confirmed_count: confirmed.length,
+				provisional_tail_count: provisionalTail.length,
+				current_provisional: currentProvisional,
+				effective_last_price:
+					currentProvisional?.close ??
+					confirmed[0]?.close ??
+					this.lastPrice ??
+					null,
 				meta,
 				columns: [
 					"datetime",
@@ -869,6 +1105,8 @@ export class Chat extends DurableObject<LiveEnv> {
 					"source",
 					"synthetic_gap",
 					"gap_adjusted",
+					"provisional",
+					"confirmed",
 				],
 				candles: candles.map((c) => [
 					c.datetime,
@@ -882,9 +1120,132 @@ export class Chat extends DurableObject<LiveEnv> {
 						c.expected_close_time,
 					),
 					c.source,
-					c.synthetic_gap,
+					false,
 					c.gap_adjusted ?? false,
+					c.provisional,
+					c.confirmed,
 				]),
+			});
+		}
+
+		if (url.pathname === "/auto/status") {
+			this.ensureAutoState();
+			return json({
+				status: "ok",
+				symbol: SYMBOL,
+				timezone: TIMEZONE,
+				auto: this.publicAutoState(),
+			});
+		}
+
+		if (url.pathname === "/auto/start") {
+			this.ensureAutoState();
+			this.autoState!.enabled = true;
+			await this.persistAutoState();
+			await this.ctx.storage.setAlarm(Date.now() + 1_000);
+			return json({
+				status: "ok",
+				auto: this.publicAutoState(),
+			});
+		}
+
+		if (url.pathname === "/auto/stop") {
+			this.ensureAutoState();
+			this.autoState!.enabled = false;
+			await this.persistAutoState();
+			await this.ctx.storage.deleteAlarm();
+			return json({
+				status: "ok",
+				auto: this.publicAutoState(),
+			});
+		}
+
+		if (url.pathname === "/auto/run") {
+			this.ensureAutoState();
+			const scope = url.searchParams.get("scope") ?? "all";
+			let outputsize = Number(
+				url.searchParams.get("outputsize") ?? AUTO_INCREMENTAL_OUTPUTSIZE,
+			);
+			if (!Number.isInteger(outputsize) || outputsize < 1) {
+				outputsize = AUTO_INCREMENTAL_OUTPUTSIZE;
+			}
+			outputsize = Math.min(outputsize, 1150);
+
+			if (scope === "all") {
+				this.enqueueAutoIntervals(
+					REST_INTERVALS,
+					outputsize,
+					"manual_auto_run",
+				);
+			} else if (isRestInterval(scope)) {
+				this.enqueueAutoIntervals(
+					[scope],
+					outputsize,
+					"manual_auto_run",
+				);
+			} else {
+				return json(
+					{
+						status: "error",
+						error: "scope must be all or a supported REST interval",
+					},
+					400,
+				);
+			}
+
+			await this.persistAutoState();
+			await this.processAutoQueue();
+			await this.scheduleAutoAlarm();
+
+			return json({
+				status: "ok",
+				auto: this.publicAutoState(),
+			});
+		}
+
+		if (url.pathname === "/system-check") {
+			const frames = [];
+			for (const interval of [
+				"1min",
+				"3min",
+				"5min",
+				"15min",
+				"30min",
+				"1h",
+				"4h",
+				"1day",
+				"1week",
+				"1month",
+			] as AnalysisNormalizedInterval[]) {
+				const latest =
+					await this.ctx.storage.list<NormalizedCandle>({
+						prefix: normalizedPrefix(interval),
+						reverse: true,
+						limit: 1,
+					});
+				const confirmed = Array.from(latest.values())[0] ?? null;
+				const provisional =
+					await this.buildCurrentProvisional(interval);
+
+				frames.push({
+					interval,
+					latest_confirmed_datetime: confirmed?.datetime ?? null,
+					latest_confirmed_close: confirmed?.close ?? null,
+					current_provisional_datetime: provisional?.datetime ?? null,
+					current_provisional_close: provisional?.close ?? null,
+					current_source: provisional?.source ?? null,
+				});
+			}
+
+			return json({
+				status: "ok",
+				symbol: SYMBOL,
+				timezone: TIMEZONE,
+				market_closed: isClosedMarketCairoDatetime(cairoTime(Date.now())),
+				last_live_price: this.lastPrice,
+				auto: this.publicAutoState(),
+				frames,
+				analysis_performed: false,
 			});
 		}
 
@@ -1051,6 +1412,17 @@ export class Chat extends DurableObject<LiveEnv> {
 					"/normalized-data?interval=3min&limit=100",
 				normalized_4h:
 					"/normalized-data?interval=4h&limit=100",
+				normalized_daily:
+					"/normalized-data?interval=1day&limit=100",
+				normalized_weekly:
+					"/normalized-data?interval=1week&limit=100",
+				normalized_monthly:
+					"/normalized-data?interval=1month&limit=100",
+				auto_status: "/auto/status",
+				auto_start: "/auto/start",
+				auto_stop: "/auto/stop",
+				auto_run: "/auto/run?scope=all",
+				system_check: "/system-check",
 				storage_state: "/storage-state",
 				purge:
 					"/purge?interval=1min&confirm=yes",
@@ -1062,6 +1434,10 @@ export class Chat extends DurableObject<LiveEnv> {
 				persistent_storage: "raw REST candles by timeframe",
 				normalized_storage:
 					"session-filtered candles with reopening gaps absorbed into the first real candle; no standalone gap rows and no market-analysis logic",
+				current_effective_chain:
+					"WebSocket -> 1min -> intraday provisional -> 4h from effective 15min -> daily from effective 1h -> weekly/monthly from effective daily",
+				auto_refresh:
+					"Durable Object alarm queue, rate-budgeted and incremental; weekly maintenance refreshes every timeframe automatically",
 				analysis:
 					"ChatGPT only — Worker does not detect FVG, liquidity, sweeps, mitigation, or market structure",
 			},
@@ -1585,7 +1961,7 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			let deletedNormalized = 0;
 
-			if (isNormalizedRestInterval(interval)) {
+			if (isNormalizedRestInterval(interval) || isHigherNativeInterval(interval)) {
 				while (true) {
 					const normalizedPage =
 						await this.ctx.storage.list<NormalizedCandle>({
@@ -1756,10 +2132,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				oldest_datetime: oldestDatetime,
 				last_request_count: validRows.length,
 				last_requested_outputsize: outputsize,
-				next_before:
-					typeof payload.next_before === "string"
-						? payload.next_before
-						: requestOldest,
+				next_before: oldestDatetime,
 				source: "historical_rest",
 			};
 
@@ -1870,9 +2243,19 @@ export class Chat extends DurableObject<LiveEnv> {
 					continue;
 				}
 
-				const gapAdjusted = pendingGap !== null;
+				const implicitClosureGap =
+					lastValid !== null &&
+					hasDeclaredClosureBetween(
+						addMinutesToCairoDatetime(
+							lastValid.datetime,
+							durationMinutes,
+						),
+						candle.datetime,
+					);
+				const gapAdjusted =
+					pendingGap !== null || implicitClosureGap;
 				const normalizedOpen = gapAdjusted
-					? pendingGap!.previous_close
+					? pendingGap?.previous_close ?? lastValid!.close
 					: candle.open;
 
 				// The reopening candle contains the whole movement from the
@@ -1895,6 +2278,12 @@ export class Chat extends DurableObject<LiveEnv> {
 						candle.datetime,
 						durationMinutes,
 					);
+
+				// REST is authoritative only after the candle closes. The
+				// still-open candle is supplied by the provisional live chain.
+				if (statusFromExpectedClose(expectedCloseTime) === "OPEN") {
+					continue;
+				}
 
 				normalized.push({
 					timeframe: interval,
@@ -2592,6 +2981,1059 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 	}
 
+	private createInitialAutoState(
+		nowCairo: string,
+		nowMs: number,
+	): AutoRefreshState {
+		return {
+			enabled: true,
+			queue: [],
+			last_5m_key: scheduleBucketKey(nowCairo, 5),
+			last_15m_key: scheduleBucketKey(nowCairo, 15),
+			last_hour_key: scheduleBucketKey(nowCairo, 60),
+			last_4h_key: fourHourScheduleKey(nowCairo),
+			last_day_key: dateKey(nowCairo),
+			last_week_close_key: null,
+			last_month_key: monthKey(nowCairo),
+			rate_window_start_ms: nowMs,
+			rate_requests: 0,
+			last_alarm_ms: null,
+			last_success_ms: null,
+			last_error: null,
+			bootstrap_pending: false,
+		};
+	}
+
+	private ensureAutoState() {
+		if (!this.autoState) {
+			const now = Date.now();
+			this.autoState = this.createInitialAutoState(
+				cairoTime(now),
+				now,
+			);
+		}
+	}
+
+	private enqueueAutoIntervals(
+		intervals: readonly RestInterval[],
+		outputsize: number,
+		reason: string,
+	) {
+		this.ensureAutoState();
+		const state = this.autoState!;
+		const now = Date.now();
+
+		for (const interval of intervals) {
+			const existing = state.queue.find(
+				(item) => item.interval === interval,
+			);
+
+			if (existing) {
+				existing.outputsize = Math.max(
+					existing.outputsize,
+					outputsize,
+				);
+				if (!existing.reason.includes(reason)) {
+					existing.reason += `|${reason}`;
+				}
+				continue;
+			}
+
+			state.queue.push({
+				interval,
+				outputsize,
+				reason,
+				enqueued_ms: now,
+				attempts: 0,
+			});
+		}
+
+		const priority: RestInterval[] = [
+			"1month",
+			"1week",
+			"1day",
+			"4h",
+			"1h",
+			"30min",
+			"15min",
+			"5min",
+			"1min",
+		];
+
+		state.queue.sort(
+			(a, b) =>
+				priority.indexOf(a.interval) -
+				priority.indexOf(b.interval),
+		);
+	}
+
+	private publicAutoState() {
+		this.ensureAutoState();
+		const state = this.autoState!;
+		return {
+			enabled: state.enabled,
+			queue_length: state.queue.length,
+			queue: state.queue.map((item) => ({
+				interval: item.interval,
+				outputsize: item.outputsize,
+				reason: item.reason,
+				attempts: item.attempts,
+			})),
+			bootstrap_pending: state.bootstrap_pending,
+			rate_requests_this_window: state.rate_requests,
+			last_alarm_time:
+				state.last_alarm_ms !== null
+					? cairoTime(state.last_alarm_ms)
+					: null,
+			last_success_time:
+				state.last_success_ms !== null
+					? cairoTime(state.last_success_ms)
+					: null,
+			last_error: state.last_error,
+			cadence: {
+				"1min_rest": "every 5 minutes while market is open",
+				"5min_rest": "every 15 minutes while market is open",
+				"15min_rest": "every hour while market is open",
+				"30min_rest": "every hour while market is open",
+				"1h_rest": "every 4H close",
+				"4h_rest": "every 4H close",
+				"1day_rest": "after each trading-day close",
+				"1week_rest": "after Friday trading closes / Saturday 00:00 Cairo",
+				"1month_rest": "at the month boundary",
+				"3min_rest": "never; derived from effective 1min",
+			},
+		};
+	}
+
+	private async persistAutoState() {
+		this.ensureAutoState();
+		await this.ctx.storage.put(AUTO_STATE_KEY, this.autoState!);
+	}
+
+	private async scheduleAutoAlarm(delayMs = AUTO_ALARM_MS) {
+		this.ensureAutoState();
+		if (!this.autoState!.enabled) {
+			return;
+		}
+		await this.ctx.storage.setAlarm(Date.now() + delayMs);
+	}
+
+	private updateScheduleAndEnqueue(nowMs: number) {
+		this.ensureAutoState();
+		const state = this.autoState!;
+		const nowCairo = cairoTime(nowMs);
+		const parts = parseCairoDatetimeParts(nowCairo);
+		if (!parts) return;
+
+		const marketClosed = isClosedMarketCairoDatetime(nowCairo);
+		const fiveKey = scheduleBucketKey(nowCairo, 5);
+		const fifteenKey = scheduleBucketKey(nowCairo, 15);
+		const hourKey = scheduleBucketKey(nowCairo, 60);
+		const fourKey = fourHourScheduleKey(nowCairo);
+		const currentDateKey = dateKey(nowCairo);
+		const currentMonthKey = monthKey(nowCairo);
+
+		if (fiveKey !== state.last_5m_key) {
+			state.last_5m_key = fiveKey;
+			if (!marketClosed) {
+				this.enqueueAutoIntervals(
+					["1min"],
+					AUTO_INCREMENTAL_OUTPUTSIZE,
+					"5m_cadence",
+				);
+			}
+		}
+
+		if (fifteenKey !== state.last_15m_key) {
+			state.last_15m_key = fifteenKey;
+			if (!marketClosed) {
+				this.enqueueAutoIntervals(
+					["5min", "1min"],
+					AUTO_INCREMENTAL_OUTPUTSIZE,
+					"15m_cadence",
+				);
+			}
+		}
+
+		if (hourKey !== state.last_hour_key) {
+			state.last_hour_key = hourKey;
+			if (!marketClosed) {
+				this.enqueueAutoIntervals(
+					["30min", "15min", "5min", "1min"],
+					AUTO_INCREMENTAL_OUTPUTSIZE,
+					"hour_cadence",
+				);
+			}
+		}
+
+		if (fourKey !== state.last_4h_key) {
+			state.last_4h_key = fourKey;
+			if (!marketClosed) {
+				this.enqueueAutoIntervals(
+					["4h", "1h", "30min", "15min", "5min", "1min"],
+					AUTO_INCREMENTAL_OUTPUTSIZE,
+					"4h_close",
+				);
+			}
+		}
+
+		if (currentDateKey !== state.last_day_key) {
+			const currentDayStart = dayStartCairo(nowCairo);
+			const currentDayStartMs = cairoDatetimeToMs(currentDayStart);
+			const previousDay =
+				currentDayStartMs !== null
+					? cairoTime(currentDayStartMs - 24 * 60 * 60 * 1000)
+					: null;
+
+			state.last_day_key = currentDateKey;
+
+			if (previousDay && isTradingDayCairo(previousDay)) {
+				this.enqueueAutoIntervals(
+					["1day", "4h", "1h", "30min", "15min", "5min", "1min"],
+					AUTO_INCREMENTAL_OUTPUTSIZE,
+					"day_close",
+				);
+			}
+		}
+
+		const dayOfWeek = cairoDayOfWeek(nowCairo);
+		if (dayOfWeek === 6 && parts.hour === 0) {
+			const weeklyKey = currentDateKey;
+			if (state.last_week_close_key !== weeklyKey) {
+				state.last_week_close_key = weeklyKey;
+				this.enqueueAutoIntervals(
+					["1week", "1day", "4h", "1h", "30min", "15min", "5min", "1min"],
+					AUTO_INCREMENTAL_OUTPUTSIZE,
+					"week_close",
+				);
+			}
+		}
+
+		if (currentMonthKey !== state.last_month_key) {
+			state.last_month_key = currentMonthKey;
+			this.enqueueAutoIntervals(
+				["1month", "1week", "1day", "4h", "1h", "30min", "15min", "5min", "1min"],
+				AUTO_INCREMENTAL_OUTPUTSIZE,
+				"month_close",
+			);
+		}
+	}
+
+	private async postAutoRefresh(item: AutoQueueItem) {
+		const bootstrap = item.reason.includes("bootstrap") || item.reason.includes("backfill");
+
+		if (isNormalizedRestInterval(item.interval)) {
+			if (bootstrap) {
+				await this.normalizeStoredInterval(item.interval);
+			} else {
+				await this.normalizeRecentStoredInterval(item.interval);
+			}
+
+			if (item.interval === "1min") {
+				if (bootstrap) {
+					await this.deriveThreeMinuteFromOneMinute();
+				} else {
+					await this.deriveRecentThreeMinuteFromOneMinute();
+				}
+			}
+
+			if (item.interval === "1h") {
+				await this.deriveFourHourFromOneHour();
+			}
+			return;
+		}
+
+		if (isHigherNativeInterval(item.interval)) {
+			await this.normalizeHigherNativeInterval(item.interval);
+		}
+	}
+
+	private async processAutoQueue() {
+		this.ensureAutoState();
+		const state = this.autoState!;
+		if (!state.enabled) return;
+
+		const now = Date.now();
+		if (
+			now - state.rate_window_start_ms >= AUTO_RATE_WINDOW_MS
+		) {
+			state.rate_window_start_ms = now;
+			state.rate_requests = 0;
+		}
+
+		while (
+			state.queue.length > 0 &&
+			state.rate_requests < AUTO_MAX_REQUESTS_PER_WINDOW
+		) {
+			const item = state.queue.shift()!;
+			state.rate_requests++;
+			await this.persistAutoState();
+
+			const result = await this.syncHistoricalInterval(
+				item.interval,
+				item.outputsize,
+				null,
+			);
+
+			if (result.status === "ok") {
+				try {
+					await this.postAutoRefresh(item);
+					state.last_success_ms = Date.now();
+					state.last_error = null;
+				} catch (error) {
+					state.last_error =
+						error instanceof Error
+							? error.message
+							: String(error);
+				}
+			} else {
+				item.attempts++;
+				state.last_error = String(
+					(result as { error?: unknown }).error ??
+						`Auto refresh failed for ${item.interval}`,
+				);
+
+				if (item.attempts < 3) {
+					state.queue.push(item);
+				}
+			}
+		}
+
+		state.bootstrap_pending = state.queue.some((item) =>
+			item.reason.includes("bootstrap"),
+		);
+		await this.persistAutoState();
+	}
+
+	async alarm() {
+		this.ensureAutoState();
+		const state = this.autoState!;
+		if (!state.enabled) return;
+
+		state.last_alarm_ms = Date.now();
+		this.updateScheduleAndEnqueue(state.last_alarm_ms);
+		await this.persistAutoState();
+
+		try {
+			await this.ensureConnection();
+			await this.processAutoQueue();
+		} catch (error) {
+			state.last_error =
+				error instanceof Error ? error.message : String(error);
+			await this.persistAutoState();
+		}
+
+		const delay =
+			state.queue.length > 0 &&
+			state.rate_requests >= AUTO_MAX_REQUESTS_PER_WINDOW
+				? Math.max(
+					1_000,
+					state.rate_window_start_ms +
+						AUTO_RATE_WINDOW_MS +
+						1_000 -
+						Date.now(),
+				)
+				: AUTO_ALARM_MS;
+
+		await this.scheduleAutoAlarm(delay);
+	}
+
+	private async normalizeRecentStoredInterval(
+		interval: NormalizedRestInterval,
+	) {
+		const durationMinutes = normalizedIntervalMinutes(interval);
+		const page = await this.ctx.storage.list<StoredHistoricalCandle>({
+			prefix: historicalPrefix(interval),
+			reverse: true,
+			limit: 160,
+		});
+		const raw = Array.from(page.values()).sort((a, b) =>
+			a.datetime.localeCompare(b.datetime),
+		);
+
+		if (raw.length === 0) {
+			return;
+		}
+
+		const earliest = raw[0].datetime;
+		const priorPage =
+			await this.ctx.storage.list<NormalizedCandle>({
+				prefix: normalizedPrefix(interval),
+				reverse: true,
+				limit: 400,
+			});
+		const priorRows = Array.from(priorPage.values())
+			.filter((c) => c.datetime < earliest)
+			.sort((a, b) => b.datetime.localeCompare(a.datetime));
+		let previous = priorRows[0] ?? null;
+
+		let filtered = 0;
+		let gapAdjustedRows = 0;
+		let valid = 0;
+
+		for (const candle of raw) {
+			if (isClosedMarketCairoDatetime(candle.datetime)) {
+				filtered++;
+				continue;
+			}
+
+			const expectedCloseTime = addMinutesToCairoDatetime(
+				candle.datetime,
+				durationMinutes,
+			);
+			if (statusFromExpectedClose(expectedCloseTime) === "OPEN") {
+				continue;
+			}
+
+			const gapAdjusted =
+				previous !== null &&
+				hasDeclaredClosureBetween(
+					previous.expected_close_time,
+					candle.datetime,
+				);
+			const open = gapAdjusted ? previous!.close : candle.open;
+			const normalized: NormalizedCandle = {
+				timeframe: interval,
+				datetime: candle.datetime,
+				open_time: candle.datetime,
+				expected_close_time: expectedCloseTime,
+				open,
+				high: Math.max(candle.high, candle.open, open),
+				low: Math.min(candle.low, candle.open, open),
+				close: candle.close,
+				status: "CLOSED",
+				source: gapAdjusted
+					? "historical_rest_gap_adjusted"
+					: "historical_rest",
+				provisional: false,
+				confirmed: true,
+				synthetic_gap: false,
+				gap_adjusted: gapAdjusted,
+				stored_at_ms: Date.now(),
+			};
+
+			await this.ctx.storage.put(
+				normalizedCandleKey(interval, candle.datetime),
+				normalized,
+			);
+			previous = normalized;
+			valid++;
+			if (gapAdjusted) gapAdjustedRows++;
+		}
+
+		const newest = await this.ctx.storage.list<NormalizedCandle>({
+			prefix: normalizedPrefix(interval),
+			reverse: true,
+			limit: 1,
+		});
+		const oldest = await this.ctx.storage.list<NormalizedCandle>({
+			prefix: normalizedPrefix(interval),
+			limit: 1,
+		});
+		const newestCandle = Array.from(newest.values())[0] ?? null;
+		const oldestCandle = Array.from(oldest.values())[0] ?? null;
+		const now = Date.now();
+		const meta: NormalizedMeta = {
+			timeframe: interval,
+			last_normalized_ms: now,
+			last_normalized_time: cairoTime(now),
+			latest_datetime: newestCandle?.datetime ?? null,
+			oldest_datetime: oldestCandle?.datetime ?? null,
+			raw_rows_seen: raw.length,
+			valid_raw_rows: valid,
+			filtered_closed_rows: filtered,
+			gap_adjusted_rows: gapAdjustedRows,
+			synthetic_gap_rows: 0,
+			pending_closed_period:
+				isClosedMarketCairoDatetime(cairoTime(now)),
+			layer: "analysis_normalized",
+		};
+		await this.ctx.storage.put(normalizedMetaKey(interval), meta);
+	}
+
+	private async deriveRecentThreeMinuteFromOneMinute() {
+		const page = await this.ctx.storage.list<NormalizedCandle>({
+			prefix: normalizedPrefix("1min"),
+			reverse: true,
+			limit: 360,
+		});
+		const source = Array.from(page.values()).sort((a, b) =>
+			a.datetime.localeCompare(b.datetime),
+		);
+		if (source.length === 0) return;
+
+		const buckets = new Map<string, NormalizedCandle[]>();
+		for (const candle of source) {
+			const bucketStart = threeMinuteBucketStart(candle.datetime);
+			if (!bucketStart) continue;
+			const rows = buckets.get(bucketStart) ?? [];
+			rows.push(candle);
+			buckets.set(bucketStart, rows);
+		}
+
+		for (const [bucketStart, rowsInput] of buckets) {
+			const rows = rowsInput.slice().sort((a, b) =>
+				a.datetime.localeCompare(b.datetime),
+			);
+			const expected = [
+				bucketStart,
+				addMinutesToCairoDatetime(bucketStart, 1),
+				addMinutesToCairoDatetime(bucketStart, 2),
+			];
+			if (
+				rows.length !== 3 ||
+				!expected.every((value, index) => rows[index]?.datetime === value)
+			) {
+				continue;
+			}
+
+			const expectedClose = addMinutesToCairoDatetime(bucketStart, 3);
+			if (statusFromExpectedClose(expectedClose) === "OPEN") continue;
+
+			const candle: NormalizedCandle = {
+				timeframe: "3min",
+				datetime: bucketStart,
+				open_time: bucketStart,
+				expected_close_time: expectedClose,
+				open: rows[0].open,
+				high: Math.max(...rows.map((c) => c.high)),
+				low: Math.min(...rows.map((c) => c.low)),
+				close: rows[2].close,
+				status: "CLOSED",
+				source: "derived_1min",
+				provisional: false,
+				confirmed: true,
+				synthetic_gap: false,
+				gap_adjusted: rows.some((c) => c.gap_adjusted),
+				stored_at_ms: Date.now(),
+			};
+			await this.ctx.storage.put(
+				normalizedCandleKey("3min", bucketStart),
+				candle,
+			);
+		}
+	}
+
+	private async normalizeHigherNativeInterval(
+		interval: HigherNativeInterval,
+	) {
+		try {
+			const raw: StoredHistoricalCandle[] = [];
+			let startAfter: string | undefined;
+
+			while (true) {
+				const page =
+					await this.ctx.storage.list<StoredHistoricalCandle>({
+						prefix: historicalPrefix(interval),
+						limit: 1000,
+						...(startAfter ? { startAfter } : {}),
+					});
+				if (page.size === 0) break;
+				raw.push(...page.values());
+				if (page.size < 1000) break;
+				const keys = Array.from(page.keys()) as string[];
+				startAfter = keys[keys.length - 1];
+			}
+
+			raw.sort((a, b) => a.datetime.localeCompare(b.datetime));
+			if (raw.length === 0) {
+				return {
+					status: "error",
+					interval,
+					error: `No stored ${interval} raw REST candles found`,
+				};
+			}
+
+			const normalized: NormalizedCandle[] = [];
+			let filteredClosedRows = 0;
+			let gapAdjustedRows = 0;
+			let previous: NormalizedCandle | null = null;
+
+			for (const candle of raw) {
+				if (interval === "1day" && !isTradingDayCairo(candle.datetime)) {
+					filteredClosedRows++;
+					continue;
+				}
+
+				const expectedCloseTime = expectedCloseForHigherInterval(
+					interval,
+					candle.datetime,
+				);
+				if (statusFromExpectedClose(expectedCloseTime) === "OPEN") {
+					continue;
+				}
+
+				const gapAdjusted = previous !== null;
+				const open = gapAdjusted ? previous!.close : candle.open;
+				const row: NormalizedCandle = {
+					timeframe: interval,
+					datetime: candle.datetime,
+					open_time: candle.datetime,
+					expected_close_time: expectedCloseTime,
+					open,
+					high: Math.max(candle.high, candle.open, open),
+					low: Math.min(candle.low, candle.open, open),
+					close: candle.close,
+					status: "CLOSED",
+					source: gapAdjusted
+						? "historical_rest_gap_adjusted"
+						: "historical_rest",
+					provisional: false,
+					confirmed: true,
+					synthetic_gap: false,
+					gap_adjusted: gapAdjusted,
+					stored_at_ms: Date.now(),
+				};
+				normalized.push(row);
+				previous = row;
+				if (gapAdjusted) gapAdjustedRows++;
+			}
+
+			while (true) {
+				const oldPage = await this.ctx.storage.list<NormalizedCandle>({
+					prefix: normalizedPrefix(interval),
+					limit: 500,
+				});
+				if (oldPage.size === 0) break;
+				const keys = Array.from(oldPage.keys());
+				for (let i = 0; i < keys.length; i += 100) {
+					await this.ctx.storage.delete(keys.slice(i, i + 100));
+				}
+			}
+
+			for (let i = 0; i < normalized.length; i += 100) {
+				const entries: Record<string, NormalizedCandle> = {};
+				for (const candle of normalized.slice(i, i + 100)) {
+					entries[normalizedCandleKey(interval, candle.datetime)] = candle;
+				}
+				await this.ctx.storage.put(entries);
+			}
+
+			const now = Date.now();
+			const meta: NormalizedMeta = {
+				timeframe: interval,
+				last_normalized_ms: now,
+				last_normalized_time: cairoTime(now),
+				latest_datetime:
+					normalized.length > 0
+						? normalized[normalized.length - 1].datetime
+						: null,
+				oldest_datetime:
+					normalized.length > 0 ? normalized[0].datetime : null,
+				raw_rows_seen: raw.length,
+				valid_raw_rows: normalized.length,
+				filtered_closed_rows: filteredClosedRows,
+				gap_adjusted_rows: gapAdjustedRows,
+				synthetic_gap_rows: 0,
+				pending_closed_period:
+					isClosedMarketCairoDatetime(cairoTime(now)),
+				layer: "analysis_normalized",
+			};
+			await this.ctx.storage.put(normalizedMetaKey(interval), meta);
+
+			return {
+				status: "ok",
+				symbol: SYMBOL,
+				timezone: TIMEZONE,
+				interval,
+				layer: "analysis_normalized",
+				historical_source: "native_twelve_data_rest",
+				raw_rows_seen: raw.length,
+				filtered_closed_rows: filteredClosedRows,
+				gap_adjusted_rows: gapAdjustedRows,
+				synthetic_gap_rows: 0,
+				normalized_rows_stored: normalized.length,
+				oldest_datetime: meta.oldest_datetime,
+				latest_datetime: meta.latest_datetime,
+				analysis_performed: false,
+				note:
+					interval === "1week"
+						? "Weekly confirmed history is native REST. Every new weekly candle absorbs the preceding weekend gap by opening at the previous confirmed weekly close."
+						: interval === "1month"
+							? "Monthly confirmed history is native REST. A month-opening price discontinuity is absorbed into the new monthly candle; gaps inside the month remain inside that same monthly candle."
+							: "Daily confirmed history is native REST. Weekend provider rows are excluded and the next real daily candle absorbs the preceding closure gap. No standalone gap candle is created.",
+			};
+		} catch (error) {
+			return {
+				status: "error",
+				interval,
+				error:
+					error instanceof Error ? error.message : String(error),
+			};
+		}
+	}
+
+	private liveCandleToNormalized(
+		candle: ProvisionalCandle,
+	): NormalizedCandle {
+		const expectedClose = addMinutesToCairoDatetime(candle.datetime, 1);
+		return {
+			timeframe: "1min",
+			datetime: candle.datetime,
+			open_time: candle.datetime,
+			expected_close_time: expectedClose,
+			open: candle.open,
+			high: candle.high,
+			low: candle.low,
+			close: candle.close,
+			status: statusFromExpectedClose(expectedClose),
+			source: "websocket_ticks",
+			provisional: true,
+			confirmed: false,
+			synthetic_gap: false,
+			gap_adjusted: candle.gap_adjusted,
+			stored_at_ms: Date.now(),
+		};
+	}
+
+	private async getEffectiveOneMinuteRows(
+		startDatetime: string,
+		endDatetime: string,
+	) {
+		const confirmedPage =
+			await this.ctx.storage.list<NormalizedCandle>({
+				prefix: normalizedPrefix("1min"),
+				reverse: true,
+				limit: 600,
+			});
+
+		const merged = new Map<string, NormalizedCandle>();
+		for (const candle of confirmedPage.values()) {
+			if (
+				candle.datetime >= startDatetime &&
+				candle.datetime <= endDatetime
+			) {
+				merged.set(candle.datetime, candle);
+			}
+		}
+
+		for (const live of this.candles) {
+			if (
+				live.datetime >= startDatetime &&
+				live.datetime <= endDatetime &&
+				!merged.has(live.datetime)
+			) {
+				merged.set(live.datetime, this.liveCandleToNormalized(live));
+			}
+		}
+
+		if (
+			this.currentCandle &&
+			this.currentCandle.datetime >= startDatetime &&
+			this.currentCandle.datetime <= endDatetime &&
+			!merged.has(this.currentCandle.datetime)
+		) {
+			merged.set(
+				this.currentCandle.datetime,
+				this.liveCandleToNormalized(this.currentCandle),
+			);
+		}
+
+		return Array.from(merged.values()).sort((a, b) =>
+			a.datetime.localeCompare(b.datetime),
+		);
+	}
+
+	private aggregateRows(
+		interval: AnalysisNormalizedInterval,
+		bucketStart: string,
+		expectedClose: string,
+		rows: NormalizedCandle[],
+		source: string,
+	): NormalizedCandle | null {
+		if (rows.length === 0) return null;
+		const sorted = rows.slice().sort((a, b) =>
+			a.datetime.localeCompare(b.datetime),
+		);
+		return {
+			timeframe: interval,
+			datetime: bucketStart,
+			open_time: bucketStart,
+			expected_close_time: expectedClose,
+			open: sorted[0].open,
+			high: Math.max(...sorted.map((c) => c.high)),
+			low: Math.min(...sorted.map((c) => c.low)),
+			close: sorted[sorted.length - 1].close,
+			status: statusFromExpectedClose(expectedClose),
+			source,
+			provisional: true,
+			confirmed: false,
+			synthetic_gap: false,
+			gap_adjusted: sorted.some((c) => c.gap_adjusted),
+			stored_at_ms: Date.now(),
+		};
+	}
+
+	private async deriveEffectiveIntradayFromOneMinute(
+		interval: "3min" | "5min" | "15min" | "30min" | "1h",
+		startDatetime: string,
+		endDatetime: string,
+	) {
+		const minutes =
+			interval === "3min"
+				? 3
+				: interval === "5min"
+					? 5
+					: interval === "15min"
+						? 15
+						: interval === "30min"
+							? 30
+							: 60;
+		const oneMinute = await this.getEffectiveOneMinuteRows(
+			startDatetime,
+			endDatetime,
+		);
+		const buckets = new Map<string, NormalizedCandle[]>();
+
+		for (const candle of oneMinute) {
+			const bucketStart = intradayBucketStart(candle.datetime, minutes);
+			if (!bucketStart) continue;
+			const rows = buckets.get(bucketStart) ?? [];
+			rows.push(candle);
+			buckets.set(bucketStart, rows);
+		}
+
+		const derived: NormalizedCandle[] = [];
+		for (const [bucketStart, rows] of buckets) {
+			const expectedClose = addMinutesToCairoDatetime(
+				bucketStart,
+				minutes,
+			);
+			const candle = this.aggregateRows(
+				interval,
+				bucketStart,
+				expectedClose,
+				rows,
+				"provisional_1min",
+			);
+			if (candle) derived.push(candle);
+		}
+
+		return derived.sort((a, b) =>
+			a.datetime.localeCompare(b.datetime),
+		);
+	}
+
+	private async getEffectiveIntradaySeries(
+		interval: "5min" | "15min" | "30min" | "1h",
+		startDatetime: string,
+		endDatetime: string,
+	) {
+		const confirmedPage =
+			await this.ctx.storage.list<NormalizedCandle>({
+				prefix: normalizedPrefix(interval),
+				reverse: true,
+				limit: 500,
+			});
+		const merged = new Map<string, NormalizedCandle>();
+
+		const derived = await this.deriveEffectiveIntradayFromOneMinute(
+			interval,
+			startDatetime,
+			endDatetime,
+		);
+		for (const candle of derived) {
+			merged.set(candle.datetime, candle);
+		}
+
+		// Confirmed REST always wins over provisional reconstruction.
+		for (const candle of confirmedPage.values()) {
+			if (
+				candle.datetime >= startDatetime &&
+				candle.datetime <= endDatetime
+			) {
+				merged.set(candle.datetime, candle);
+			}
+		}
+
+		return Array.from(merged.values()).sort((a, b) =>
+			a.datetime.localeCompare(b.datetime),
+		);
+	}
+
+	private async getEffectiveDailySeries(
+		startDatetime: string,
+		endDatetime: string,
+	) {
+		const confirmedPage =
+			await this.ctx.storage.list<NormalizedCandle>({
+				prefix: normalizedPrefix("1day"),
+				reverse: true,
+				limit: 40,
+			});
+		const merged = new Map<string, NormalizedCandle>();
+		for (const candle of confirmedPage.values()) {
+			if (
+				candle.datetime >= startDatetime &&
+				candle.datetime <= endDatetime
+			) {
+				merged.set(candle.datetime, candle);
+			}
+		}
+
+		const current = await this.buildCurrentProvisional("1day");
+		if (
+			current &&
+			current.datetime >= startDatetime &&
+			current.datetime <= endDatetime
+		) {
+			merged.set(current.datetime, current);
+		}
+
+		return Array.from(merged.values()).sort((a, b) =>
+			a.datetime.localeCompare(b.datetime),
+		);
+	}
+
+	private async buildCurrentProvisional(
+		interval: AnalysisNormalizedInterval,
+	): Promise<NormalizedCandle | null> {
+		const nowMs = Date.now();
+		const nowCairo = cairoTime(nowMs);
+
+		if (isClosedMarketCairoDatetime(nowCairo)) {
+			return null;
+		}
+
+		if (interval === "1min") {
+			if (!this.currentCandle) return null;
+			return this.liveCandleToNormalized(this.currentCandle);
+		}
+
+		if (
+			interval === "3min" ||
+			interval === "5min" ||
+			interval === "15min" ||
+			interval === "30min" ||
+			interval === "1h"
+		) {
+			const minutes =
+				interval === "3min"
+					? 3
+					: interval === "5min"
+						? 5
+						: interval === "15min"
+							? 15
+							: interval === "30min"
+								? 30
+								: 60;
+			const bucketStart = intradayBucketStart(nowCairo, minutes);
+			if (!bucketStart) return null;
+			const rows = await this.getEffectiveOneMinuteRows(
+				bucketStart,
+				nowCairo,
+			);
+			return this.aggregateRows(
+				interval,
+				bucketStart,
+				addMinutesToCairoDatetime(bucketStart, minutes),
+				rows,
+				"provisional_1min",
+			);
+		}
+
+		if (interval === "4h") {
+			const bucketStart = fourHourBucketStart(nowCairo);
+			if (!bucketStart) return null;
+			const rows = await this.getEffectiveIntradaySeries(
+				"15min",
+				bucketStart,
+				nowCairo,
+			);
+			return this.aggregateRows(
+				"4h",
+				bucketStart,
+				addMinutesToCairoDatetime(bucketStart, 240),
+				rows,
+				"provisional_15min",
+			);
+		}
+
+		if (interval === "1day") {
+			const bucketStart = dayStartCairo(nowCairo);
+			const rows = await this.getEffectiveIntradaySeries(
+				"1h",
+				bucketStart,
+				nowCairo,
+			);
+			return this.aggregateRows(
+				"1day",
+				bucketStart,
+				addMinutesToCairoDatetime(bucketStart, 24 * 60),
+				rows,
+				"provisional_1h",
+			);
+		}
+
+		if (interval === "1week") {
+			const bucketStart = weekStartMondayCairo(nowCairo);
+			const rows = await this.getEffectiveDailySeries(
+				bucketStart,
+				nowCairo,
+			);
+			return this.aggregateRows(
+				"1week",
+				bucketStart,
+				addMinutesToCairoDatetime(bucketStart, 7 * 24 * 60),
+				rows,
+				"provisional_1day",
+			);
+		}
+
+		const bucketStart = monthStartCairo(nowCairo);
+		const rows = await this.getEffectiveDailySeries(
+			bucketStart,
+			nowCairo,
+		);
+		return this.aggregateRows(
+			"1month",
+			bucketStart,
+			nextMonthStartCairo(bucketStart),
+			rows,
+			"provisional_1day",
+		);
+	}
+
+	private async buildProvisionalTail(
+		interval: AnalysisNormalizedInterval,
+	) {
+		if (
+			interval === "4h" ||
+			interval === "1day" ||
+			interval === "1week" ||
+			interval === "1month"
+		) {
+			const current = await this.buildCurrentProvisional(interval);
+			return current ? [current] : [];
+		}
+
+		const latestPage =
+			await this.ctx.storage.list<NormalizedCandle>({
+				prefix: normalizedPrefix(interval),
+				reverse: true,
+				limit: 1,
+			});
+		const latest = Array.from(latestPage.values())[0] ?? null;
+		const nowCairo = cairoTime(Date.now());
+		if (isClosedMarketCairoDatetime(nowCairo)) return [];
+
+		if (interval === "1min") {
+			const start = latest?.expected_close_time ??
+				cairoTime(Date.now() - 8 * 60 * 60 * 1000);
+			const rows = await this.getEffectiveOneMinuteRows(start, nowCairo);
+			return rows.filter((c) => !latest || c.datetime > latest.datetime);
+		}
+
+		const start = latest?.expected_close_time ??
+			cairoTime(Date.now() - 8 * 60 * 60 * 1000);
+		const rows = await this.deriveEffectiveIntradayFromOneMinute(
+			interval,
+			start,
+			nowCairo,
+		);
+		return rows.filter((c) => !latest || c.datetime > latest.datetime);
+	}
+
 	private getState() {
 		return {
 			status: "ok",
@@ -2648,6 +4090,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			last_error:
 				this.lastError,
 
+			auto_refresh: this.publicAutoState(),
+
 			data_policy: {
 				websocket:
 					"PROVISIONAL",
@@ -2656,7 +4100,9 @@ export class Chat extends DurableObject<LiveEnv> {
 					"AUTHORITATIVE",
 
 				rule:
-					"If REST historical data differs from tick-built candles, REST replaces the provisional data.",
+					"If REST historical data differs from provisional data, REST replaces the overlap after candle close. No standalone gap candle is ever created.",
+				provisional_chain:
+					"The open part of every timeframe is rebuilt from the freshest effective lower timeframe so its latest close follows the live price.",
 			},
 		};
 	}
