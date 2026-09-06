@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v9-daily-native-repair-2026-09-06";
+const BUILD_VERSION = "v10-effective-pagination-2026-09-06";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -1062,23 +1062,61 @@ export class Chat extends DurableObject<LiveEnv> {
 				limit = 100;
 			}
 
-			limit = Math.min(limit, 1000);
+			// Keep individual Action responses compact enough for GPT Actions.
+			// Larger analytical windows are read through the cache cursor
+			// (`next_before`) without making any Twelve Data REST request.
+			limit = Math.min(limit, 200);
+
+			const beforeParam = url.searchParams.get("before");
+			const before =
+				beforeParam && beforeParam.trim().length > 0
+					? canonicalCairoDatetime(beforeParam.trim())
+					: null;
+
+			if (beforeParam && !before) {
+				return json(
+					{
+						status: "error",
+						error:
+							"Invalid before cursor. Use the exact next_before value returned by the previous page.",
+					},
+					400,
+				);
+			}
+
+			const listOptions: Record<string, unknown> = {
+				prefix: normalizedPrefix(interval),
+				reverse: true,
+				// One extra confirmed row lets the endpoint advertise whether
+				// another cache page exists without a second storage read.
+				limit: limit + 1,
+			};
+
+			if (before) {
+				// Durable Object list `end` is exclusive. Since normalized
+				// keys end with canonical datetime, this returns rows strictly
+				// older than the cursor and prevents boundary duplication.
+				listOptions.end =
+					normalizedCandleKey(interval, before);
+			}
 
 			const rows =
-				await this.ctx.storage.list<NormalizedCandle>({
-					prefix: normalizedPrefix(interval),
-					reverse: true,
-					limit,
-				});
+				await this.ctx.storage.list<NormalizedCandle>(
+					listOptions,
+				);
 
-			const confirmed = Array.from(rows.values()).sort((a, b) =>
-				b.datetime.localeCompare(a.datetime),
+			const confirmedWindow = Array.from(rows.values()).sort(
+				(a, b) => b.datetime.localeCompare(a.datetime),
 			);
 
-			const provisionalTail =
-				await this.buildProvisionalTail(interval);
+			// The provisional tail belongs only on the newest page.
+			// Historical cursor pages must never repeat the live/current tail.
+			const provisionalTail = before
+				? []
+				: await this.buildProvisionalTail(interval);
+
 			const currentProvisional =
-				provisionalTail.length > 0
+				!before && provisionalTail.length > 0
 					? provisionalTail[provisionalTail.length - 1]
 					: null;
 
@@ -1087,13 +1125,45 @@ export class Chat extends DurableObject<LiveEnv> {
 				merged.set(candle.datetime, candle);
 			}
 			// Confirmed REST/derived-confirmed history wins on overlap.
-			for (const candle of confirmed) {
+			for (const candle of confirmedWindow) {
 				merged.set(candle.datetime, candle);
 			}
 
-			const candles = Array.from(merged.values())
-				.sort((a, b) => b.datetime.localeCompare(a.datetime))
-				.slice(0, limit);
+			const mergedSorted = Array.from(merged.values()).sort(
+				(a, b) => b.datetime.localeCompare(a.datetime),
+			);
+
+			const candles = mergedSorted.slice(0, limit);
+			const oldestReturned =
+				candles.length > 0
+					? candles[candles.length - 1].datetime
+					: null;
+
+			const returnedConfirmedDatetimes = new Set(
+				candles
+					.filter((c) => c.confirmed === true)
+					.map((c) => c.datetime),
+			);
+
+			const hasMoreConfirmed =
+				oldestReturned !== null &&
+				confirmedWindow.some(
+					(c) =>
+						c.datetime.localeCompare(oldestReturned) < 0 ||
+						!returnedConfirmedDatetimes.has(c.datetime),
+				);
+
+			const nextBefore =
+				hasMoreConfirmed && oldestReturned
+					? oldestReturned
+					: null;
+
+			const confirmedReturnedCount = candles.filter(
+				(c) => c.confirmed === true,
+			).length;
+			const provisionalReturnedCount = candles.filter(
+				(c) => c.provisional === true,
+			).length;
 
 			const meta =
 				(await this.ctx.storage.get<
@@ -1109,14 +1179,24 @@ export class Chat extends DurableObject<LiveEnv> {
 				interval,
 				layer: "analysis_normalized_effective",
 				count: candles.length,
-				confirmed_count: confirmed.length,
-				provisional_tail_count: provisionalTail.length,
+				confirmed_count: confirmedReturnedCount,
+				provisional_tail_count: provisionalReturnedCount,
 				current_provisional: currentProvisional,
 				effective_last_price:
-					currentProvisional?.close ??
-					confirmed[0]?.close ??
-					this.lastPrice ??
-					null,
+					!before
+						? currentProvisional?.close ??
+							candles[0]?.close ??
+							this.lastPrice ??
+							null
+						: candles[0]?.close ?? null,
+				pagination: {
+					page_limit: limit,
+					requested_before: before,
+					has_more: hasMoreConfirmed,
+					next_before: nextBefore,
+					source: "durable_object_effective_cache",
+					twelve_data_request_per_page: 0,
+				},
 				meta,
 				columns: [
 					"datetime",
