@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v10-effective-pagination-2026-09-06";
+const BUILD_VERSION = "v11-weekly-provisional-anchor-2026-09-07";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -4206,13 +4206,49 @@ export class Chat extends DurableObject<LiveEnv> {
 				bucketStart,
 				nowCairo,
 			);
-			return this.aggregateRows(
+			const weekly = this.aggregateRows(
 				"1week",
 				bucketStart,
 				expectedClose,
 				rows,
 				"provisional_1day",
 			);
+
+			if (!weekly) {
+				return null;
+			}
+
+			// Project rule: every new weekly candle begins at the previous
+			// confirmed weekly close, so the weekend discontinuity is absorbed
+			// inside the new weekly candle rather than inheriting the first
+			// Daily candle's gap-adjusted open.
+			const previousWeeklyPage =
+				await this.ctx.storage.list<NormalizedCandle>({
+					prefix: normalizedPrefix("1week"),
+					reverse: true,
+					limit: 20,
+				});
+
+			const previousConfirmedWeekly =
+				Array.from(previousWeeklyPage.values())
+					.filter(
+						(candle) =>
+							candle.confirmed === true &&
+							candle.datetime < bucketStart,
+					)
+					.sort((a, b) =>
+						b.datetime.localeCompare(a.datetime),
+					)[0] ?? null;
+
+			if (previousConfirmedWeekly) {
+				const anchoredOpen = previousConfirmedWeekly.close;
+				weekly.open = anchoredOpen;
+				weekly.high = Math.max(weekly.high, anchoredOpen);
+				weekly.low = Math.min(weekly.low, anchoredOpen);
+				weekly.gap_adjusted = true;
+			}
+
+			return weekly;
 		}
 
 		const bucketStart = monthStartCairo(nowCairo);
