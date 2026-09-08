@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v14.1-write-efficient-quota-safe-read-2026-09-08";
+const BUILD_VERSION = "v14.2-write-efficient-quota-shield-2026-09-08";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -1422,11 +1422,22 @@ export class Chat extends DurableObject<LiveEnv> {
 		if (url.pathname === "/system-check") {
 			let migration: unknown;
 			try {
-				migration = await this.ensureStorageMigration();
+				const storedMigrationVersion =
+					(await this.ctx.storage.get<string>(STORAGE_MIGRATION_KEY)) ?? null;
+				migration = {
+					status:
+						storedMigrationVersion === STORAGE_MIGRATION_VERSION
+							? "ok"
+							: "pending_or_unknown",
+					version: storedMigrationVersion,
+					expected_version: STORAGE_MIGRATION_VERSION,
+					read_only_check: true,
+				};
 			} catch (error) {
 				migration = {
 					status: "error",
 					error: error instanceof Error ? error.message : String(error),
+					read_only_check: true,
 				};
 			}
 			const frames = [];
@@ -3436,15 +3447,29 @@ export class Chat extends DurableObject<LiveEnv> {
 
 	private async persistAutoState() {
 		this.ensureAutoState();
-		await this.ctx.storage.put(AUTO_STATE_KEY, this.autoState!);
+		try {
+			await this.ctx.storage.put(AUTO_STATE_KEY, this.autoState!);
+			return true;
+		} catch (error) {
+			this.lastError =
+				error instanceof Error ? error.message : String(error);
+			return false;
+		}
 	}
 
 	private async scheduleAutoAlarm(delayMs = AUTO_ALARM_MS) {
 		this.ensureAutoState();
 		if (!this.autoState!.enabled) {
-			return;
+			return false;
 		}
-		await this.ctx.storage.setAlarm(Date.now() + delayMs);
+		try {
+			await this.ctx.storage.setAlarm(Date.now() + delayMs);
+			return true;
+		} catch (error) {
+			this.lastError =
+				error instanceof Error ? error.message : String(error);
+			return false;
+		}
 	}
 
 
@@ -4080,57 +4105,79 @@ export class Chat extends DurableObject<LiveEnv> {
 	}
 
 	async alarm() {
-		this.ensureAutoState();
-		const state = this.autoState!;
-		if (!state.enabled) return;
-
-		state.last_alarm_ms = Date.now();
-
-		// Apply one-time storage migrations automatically after deploy.
-		// This does not consume Twelve Data API credits.
-		await this.ensureStorageMigration();
-
-		// Audit recovery on a bounded cadence, and immediately after any long
-		// period without a successful REST refresh. This avoids scanning the
-		// full recent effective chain on every one-minute alarm while still
-		// self-healing after a scheduler outage.
-		const recoveryAuditDue =
-			state.last_recovery_audit_ms == null ||
-			state.last_alarm_ms - state.last_recovery_audit_ms >=
-				AUTO_RECOVERY_AUDIT_INTERVAL_MS;
-		const restSuccessStale =
-			state.last_success_ms == null ||
-			state.last_alarm_ms - state.last_success_ms >= 10 * 60_000;
-		if (recoveryAuditDue || restSuccessStale) {
-			await this.enqueueStaleRecovery(state.last_alarm_ms);
-		}
-		this.updateScheduleAndEnqueue(state.last_alarm_ms);
-		await this.persistAutoState();
-
 		try {
-			await this.ensureConnection();
-			await this.processAutoQueue();
-		} catch (error) {
-			state.last_error =
-				error instanceof Error ? error.message : String(error);
+			this.ensureAutoState();
+			const state = this.autoState!;
+			if (!state.enabled) return;
+
+			state.last_alarm_ms = Date.now();
+
+			try {
+				const migration = await this.ensureStorageMigration();
+				if (
+					migration &&
+					typeof migration === "object" &&
+					"status" in migration &&
+					(migration as { status?: unknown }).status === "error"
+				) {
+					state.last_error = String(
+						(migration as { error?: unknown }).error ??
+							"Storage migration check failed",
+					);
+				}
+			} catch (error) {
+				state.last_error =
+					error instanceof Error ? error.message : String(error);
+			}
+
+			const recoveryAuditDue =
+				state.last_recovery_audit_ms == null ||
+				state.last_alarm_ms - state.last_recovery_audit_ms >=
+					AUTO_RECOVERY_AUDIT_INTERVAL_MS;
+			const restSuccessStale =
+				state.last_success_ms == null ||
+				state.last_alarm_ms - state.last_success_ms >= 10 * 60_000;
+
+			if (recoveryAuditDue || restSuccessStale) {
+				try {
+					await this.enqueueStaleRecovery(state.last_alarm_ms);
+				} catch (error) {
+					state.last_error =
+						error instanceof Error ? error.message : String(error);
+				}
+			}
+
+			this.updateScheduleAndEnqueue(state.last_alarm_ms);
 			await this.persistAutoState();
+
+			try {
+				await this.ensureConnection();
+				await this.processAutoQueue();
+			} catch (error) {
+				state.last_error =
+					error instanceof Error ? error.message : String(error);
+				await this.persistAutoState();
+			}
+
+			const delay =
+				state.queue.length > 0 &&
+				state.rate_requests >= AUTO_MAX_REQUESTS_PER_WINDOW
+					? Math.max(
+						1_000,
+						state.rate_window_start_ms +
+							AUTO_RATE_WINDOW_MS +
+							1_000 -
+							Date.now(),
+					)
+					: AUTO_ALARM_MS;
+
+			await this.scheduleAutoAlarm(delay);
+		} catch (error) {
+			this.lastError =
+				error instanceof Error ? error.message : String(error);
+			return;
 		}
-
-		const delay =
-			state.queue.length > 0 &&
-			state.rate_requests >= AUTO_MAX_REQUESTS_PER_WINDOW
-				? Math.max(
-					1_000,
-					state.rate_window_start_ms +
-						AUTO_RATE_WINDOW_MS +
-						1_000 -
-						Date.now(),
-				)
-				: AUTO_ALARM_MS;
-
-		await this.scheduleAutoAlarm(delay);
 	}
-
 
 	private async normalizeRecentStoredInterval(
 		interval: NormalizedRestInterval,
@@ -5043,34 +5090,24 @@ export class Chat extends DurableObject<LiveEnv> {
 	}
 
 	private async persist() {
-		await this.ctx.storage.put("live_state", {
-			enabled:
-				this.enabled,
-
-			lastPrice:
-				this.lastPrice,
-
-			lastTickMs:
-				this.lastTickMs,
-
-			tickCount:
-				this.tickCount,
-
-			reconnectCount:
-				this.reconnectCount,
-
-			currentCandle:
-				this.currentCandle,
-
-			candles:
-				this.candles,
-
-			lastError:
-				this.lastError,
-
-			subscribeStatus:
-				this.subscribeStatus,
-		});
+		try {
+			await this.ctx.storage.put("live_state", {
+				enabled: this.enabled,
+				lastPrice: this.lastPrice,
+				lastTickMs: this.lastTickMs,
+				tickCount: this.tickCount,
+				reconnectCount: this.reconnectCount,
+				currentCandle: this.currentCandle,
+				candles: this.candles,
+				lastError: this.lastError,
+				subscribeStatus: this.subscribeStatus,
+			});
+			return true;
+		} catch (error) {
+			this.lastError =
+				error instanceof Error ? error.message : String(error);
+			return false;
+		}
 	}
 }
 
@@ -5081,12 +5118,48 @@ export default {
 		request: Request,
 		env: LiveEnv,
 	) {
-		const id =
-			env.Chat.idFromName("XAUUSD");
+		const url = new URL(request.url);
 
-		const stub =
-			env.Chat.get(id);
+		if (url.pathname === "/ping" || url.pathname === "/version") {
+			return json({
+				status: "ok",
+				build_version: BUILD_VERSION,
+				service: "Gold Data Engine outer worker",
+				durable_object_touched: false,
+			});
+		}
 
-		return stub.fetch(request);
+		try {
+			const id = env.Chat.idFromName("XAUUSD");
+			const stub = env.Chat.get(id);
+			return await stub.fetch(request);
+		} catch (error) {
+			const anyError = error as {
+				message?: unknown;
+				name?: unknown;
+				remote?: unknown;
+				retryable?: unknown;
+				overloaded?: unknown;
+			};
+			return json(
+				{
+					status: "error",
+					build_version: BUILD_VERSION,
+					component: "durable_object",
+					error:
+						anyError?.message != null
+							? String(anyError.message)
+							: String(error),
+					name:
+						anyError?.name != null ? String(anyError.name) : null,
+					remote: Boolean(anyError?.remote),
+					retryable: Boolean(anyError?.retryable),
+					overloaded: Boolean(anyError?.overloaded),
+					note:
+						"The outer Worker is healthy; the Durable Object request failed and was caught for diagnostics.",
+				},
+				503,
+			);
+		}
 	},
 };
