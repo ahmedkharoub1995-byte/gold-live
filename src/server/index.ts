@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v11-weekly-provisional-anchor-2026-09-07";
+const BUILD_VERSION = "v12-self-healing-data-recovery-2026-09-08";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -19,6 +19,21 @@ const AUTO_RATE_WINDOW_MS = 60_000;
 const AUTO_MAX_REQUESTS_PER_WINDOW = 7;
 const AUTO_INCREMENTAL_OUTPUTSIZE = 12;
 const AUTO_BOOTSTRAP_OUTPUTSIZE = 1150;
+
+// Self-healing scheduler / continuity recovery.
+const AUTO_WATCHDOG_STALE_MS = 3 * 60_000;
+const RECOVERY_BUFFER_ROWS = 40;
+const RECOVERY_MAX_OUTPUTSIZE = 1150;
+const CONTINUITY_SCAN_CONFIRMED_LIMIT = 1000;
+const AUTO_RECOVERY_AUDIT_INTERVAL_MS = 5 * 60_000;
+const RECOVERY_INTERVALS = [
+	"1min",
+	"5min",
+	"15min",
+	"30min",
+	"1h",
+] as const;
+type RecoveryInterval = (typeof RECOVERY_INTERVALS)[number];
 
 // One-time normalized-storage migration marker.
 // v8 fixes Twelve Data date-only higher-timeframe timestamps and
@@ -185,6 +200,27 @@ type AutoQueueItem = {
 	reason: string;
 	enqueued_ms: number;
 	attempts: number;
+	// Optional targeted REST end_date cursor used by continuity backfill.
+	before?: string | null;
+};
+
+type ContinuityGap = {
+	interval: AnalysisNormalizedInterval;
+	before_datetime: string;
+	missing_from: string;
+	missing_to: string;
+	after_datetime: string;
+	missing_buckets: number;
+	missing_market_minutes: number;
+};
+
+type ContinuityAudit = {
+	interval: AnalysisNormalizedInterval;
+	latest_effective_datetime: string | null;
+	latest_confirmed_datetime: string | null;
+	current_provisional_datetime: string | null;
+	gap: ContinuityGap | null;
+	effective_fresh: boolean;
 };
 
 type AutoRefreshState = {
@@ -203,6 +239,7 @@ type AutoRefreshState = {
 	last_success_ms: number | null;
 	last_error: string | null;
 	bootstrap_pending: boolean;
+	last_recovery_audit_ms?: number | null;
 };
 
 type HistoricalWorkerPayload = {
@@ -703,6 +740,10 @@ export class Chat extends DurableObject<LiveEnv> {
 
 	async fetch(request: Request) {
 		const url = new URL(request.url);
+
+		// Read traffic itself acts as a watchdog. If Cloudflare ever loses or
+		// strands the Durable Object alarm, the next request re-arms it.
+		await this.ensureAutoWatchdog();
 
 		if (url.pathname === "/start") {
 			this.enabled = true;
@@ -1306,6 +1347,11 @@ export class Chat extends DurableObject<LiveEnv> {
 				status: "ok",
 				auto: this.publicAutoState(),
 			});
+		}
+
+		if (url.pathname === "/ensure-data-ready") {
+			const result = await this.ensureGoldDataReady();
+			return json(result, result.status === "error" ? 500 : 200);
 		}
 
 		if (url.pathname === "/system-check") {
@@ -3273,9 +3319,13 @@ export class Chat extends DurableObject<LiveEnv> {
 				interval: item.interval,
 				outputsize: item.outputsize,
 				reason: item.reason,
+				before: item.before ?? null,
 				attempts: item.attempts,
 			})),
 			bootstrap_pending: state.bootstrap_pending,
+			recovery_pending: state.queue.some((item) =>
+				item.reason.includes("recovery") || item.reason.includes("backfill"),
+			),
 			rate_requests_this_window: state.rate_requests,
 			last_alarm_time:
 				state.last_alarm_ms !== null
@@ -3286,6 +3336,10 @@ export class Chat extends DurableObject<LiveEnv> {
 					? cairoTime(state.last_success_ms)
 					: null,
 			last_error: state.last_error,
+			last_recovery_audit_time:
+				state.last_recovery_audit_ms != null
+					? cairoTime(state.last_recovery_audit_ms)
+					: null,
 			cadence: {
 				"1min_rest": "every 5 minutes while market is open",
 				"5min_rest": "every 15 minutes while market is open",
@@ -3312,6 +3366,331 @@ export class Chat extends DurableObject<LiveEnv> {
 			return;
 		}
 		await this.ctx.storage.setAlarm(Date.now() + delayMs);
+	}
+
+
+	private async ensureAutoWatchdog() {
+		this.ensureAutoState();
+		const state = this.autoState!;
+		if (!state.enabled) {
+			return {
+				enabled: false,
+				rearmed: false,
+				scheduled_alarm_ms: null as number | null,
+			};
+		}
+
+		const now = Date.now();
+		const scheduled = await this.ctx.storage.getAlarm();
+		const stateStale =
+			state.last_alarm_ms === null ||
+			now - state.last_alarm_ms > AUTO_WATCHDOG_STALE_MS;
+		const alarmMissingOrPast = scheduled === null || scheduled <= now;
+		const alarmSuspiciouslyFar =
+			stateStale && scheduled !== null && scheduled > now + 2 * AUTO_ALARM_MS;
+
+		if (alarmMissingOrPast || alarmSuspiciouslyFar) {
+			const next = now + 1_000;
+			await this.ctx.storage.setAlarm(next);
+			return {
+				enabled: true,
+				rearmed: true,
+				scheduled_alarm_ms: next,
+			};
+		}
+
+		return {
+			enabled: true,
+			rearmed: false,
+			scheduled_alarm_ms: scheduled,
+		};
+	}
+
+	private continuityIntervalMinutes(interval: AnalysisNormalizedInterval) {
+		if (interval === "3min") return 3;
+		if (interval === "4h") return 240;
+		if (interval === "1day") return 1440;
+		if (interval === "1week") return 10080;
+		if (interval === "1month") return 43200;
+		return normalizedIntervalMinutes(interval as NormalizedRestInterval);
+	}
+
+	private countMissingMarketBuckets(
+		fromDatetime: string,
+		toDatetime: string,
+		interval: AnalysisNormalizedInterval,
+	) {
+		const minutes = this.continuityIntervalMinutes(interval);
+		let cursor = addMinutesToCairoDatetime(fromDatetime, minutes);
+		let first: string | null = null;
+		let last: string | null = null;
+		let count = 0;
+		let guard = 0;
+
+		while (cursor < toDatetime && guard < 20_000) {
+			guard++;
+			if (!isClosedMarketCairoDatetime(cursor)) {
+				if (first === null) first = cursor;
+				last = cursor;
+				count++;
+			}
+			cursor = addMinutesToCairoDatetime(cursor, minutes);
+		}
+
+		return { first, last, count };
+	}
+
+	private async effectiveRowsForContinuity(
+		interval: AnalysisNormalizedInterval,
+	) {
+		const confirmedPage =
+			await this.ctx.storage.list<NormalizedCandle>({
+				prefix: normalizedPrefix(interval),
+				reverse: true,
+				limit: CONTINUITY_SCAN_CONFIRMED_LIMIT,
+			});
+		const provisional = await this.buildProvisionalTail(interval);
+		const merged = new Map<string, NormalizedCandle>();
+		for (const candle of provisional) merged.set(candle.datetime, candle);
+		// Confirmed REST/derived-confirmed rows remain authoritative on overlap.
+		for (const candle of confirmedPage.values()) merged.set(candle.datetime, candle);
+		return Array.from(merged.values()).sort((a, b) =>
+			a.datetime.localeCompare(b.datetime),
+		);
+	}
+
+	private async auditContinuity(
+		interval: AnalysisNormalizedInterval,
+	): Promise<ContinuityAudit> {
+		const rows = await this.effectiveRowsForContinuity(interval);
+		const confirmed = rows.filter((row) => row.confirmed === true);
+		const provisional = rows.filter((row) => row.provisional === true);
+		let gap: ContinuityGap | null = null;
+
+		// Find the newest actual market-hours gap. Normal daily/weekend closure
+		// buckets are ignored by countMissingMarketBuckets().
+		for (let i = rows.length - 2; i >= 0; i--) {
+			const before = rows[i];
+			const after = rows[i + 1];
+			const missing = this.countMissingMarketBuckets(
+				before.datetime,
+				after.datetime,
+				interval,
+			);
+			if (missing.count > 0 && missing.first && missing.last) {
+				gap = {
+					interval,
+					before_datetime: before.datetime,
+					missing_from: missing.first,
+					missing_to: missing.last,
+					after_datetime: after.datetime,
+					missing_buckets: missing.count,
+					missing_market_minutes:
+						missing.count * this.continuityIntervalMinutes(interval),
+				};
+				break;
+			}
+		}
+
+		const latest = rows.length > 0 ? rows[rows.length - 1] : null;
+		const latestMs = latest ? cairoDatetimeToMs(latest.datetime) : null;
+		const allowedLagMs = Math.max(
+			5 * 60_000,
+			this.continuityIntervalMinutes(interval) * 2 * 60_000,
+		);
+		const effectiveFresh =
+			isClosedMarketCairoDatetime(cairoTime(Date.now())) ||
+			(latestMs !== null && Date.now() - latestMs <= allowedLagMs);
+
+		return {
+			interval,
+			latest_effective_datetime: latest?.datetime ?? null,
+			latest_confirmed_datetime:
+				confirmed.length > 0 ? confirmed[confirmed.length - 1].datetime : null,
+			current_provisional_datetime:
+				provisional.length > 0
+					? provisional[provisional.length - 1].datetime
+					: null,
+			gap,
+			effective_fresh: effectiveFresh,
+		};
+	}
+
+	private recoveryOutputsizeForGap(
+		interval: RecoveryInterval,
+		gap: ContinuityGap,
+	) {
+		return Math.min(
+			RECOVERY_MAX_OUTPUTSIZE,
+			Math.max(
+				AUTO_INCREMENTAL_OUTPUTSIZE,
+				gap.missing_buckets + RECOVERY_BUFFER_ROWS,
+			),
+		);
+	}
+
+	private recoveryOutputsizeForStaleness(
+		interval: RecoveryInterval,
+		latestConfirmed: string | null,
+	) {
+		if (!latestConfirmed) return AUTO_BOOTSTRAP_OUTPUTSIZE;
+		const startMs = cairoDatetimeToMs(latestConfirmed);
+		if (startMs === null) return AUTO_BOOTSTRAP_OUTPUTSIZE;
+		const elapsedMinutes = Math.max(0, Math.ceil((Date.now() - startMs) / 60_000));
+		const duration = this.continuityIntervalMinutes(interval);
+		return Math.min(
+			RECOVERY_MAX_OUTPUTSIZE,
+			Math.max(
+				AUTO_INCREMENTAL_OUTPUTSIZE,
+				Math.ceil(elapsedMinutes / duration) + RECOVERY_BUFFER_ROWS,
+			),
+		);
+	}
+
+	private enqueueAutoRepair(
+		interval: RecoveryInterval,
+		outputsize: number,
+		before: string | null,
+		reason: string,
+	) {
+		this.ensureAutoState();
+		const state = this.autoState!;
+		const existing = state.queue.find(
+			(item) => item.interval === interval && (item.before ?? null) === before,
+		);
+		if (existing) {
+			existing.outputsize = Math.max(existing.outputsize, outputsize);
+			if (!existing.reason.includes(reason)) existing.reason += `|${reason}`;
+			return;
+		}
+		state.queue.push({
+			interval,
+			outputsize: Math.min(RECOVERY_MAX_OUTPUTSIZE, Math.max(1, outputsize)),
+			reason,
+			enqueued_ms: Date.now(),
+			attempts: 0,
+			before,
+		});
+	}
+
+	private async enqueueStaleRecovery(nowMs: number) {
+		this.ensureAutoState();
+		this.autoState!.last_recovery_audit_ms = nowMs;
+		if (isClosedMarketCairoDatetime(cairoTime(nowMs))) return;
+		for (const interval of RECOVERY_INTERVALS) {
+			const audit = await this.auditContinuity(interval);
+			if (audit.gap) {
+				this.enqueueAutoRepair(
+					interval,
+					this.recoveryOutputsizeForGap(interval, audit.gap),
+					audit.gap.after_datetime,
+					"auto_recovery_backfill",
+				);
+				continue;
+			}
+			if (!audit.effective_fresh) {
+				this.enqueueAutoRepair(
+					interval,
+					this.recoveryOutputsizeForStaleness(
+						interval,
+						audit.latest_confirmed_datetime,
+					),
+					null,
+					"auto_recovery_backfill",
+				);
+			}
+		}
+	}
+
+	private async ensureGoldDataReady() {
+		try {
+			const watchdog = await this.ensureAutoWatchdog();
+			await this.ensureConnection();
+			await this.ensureStorageMigration();
+			this.ensureAutoState();
+			this.autoState!.enabled = true;
+
+			const beforeAudits: ContinuityAudit[] = [];
+			for (const interval of RECOVERY_INTERVALS) {
+				const audit = await this.auditContinuity(interval);
+				beforeAudits.push(audit);
+				if (audit.gap) {
+					this.enqueueAutoRepair(
+						interval,
+						this.recoveryOutputsizeForGap(interval, audit.gap),
+						audit.gap.after_datetime,
+						"gpt_recovery_backfill",
+					);
+				} else if (!audit.effective_fresh) {
+					this.enqueueAutoRepair(
+						interval,
+						this.recoveryOutputsizeForStaleness(
+							interval,
+							audit.latest_confirmed_datetime,
+						),
+						null,
+						"gpt_recovery_backfill",
+					);
+				}
+			}
+
+			await this.persistAutoState();
+			await this.processAutoQueue();
+			await this.scheduleAutoAlarm();
+
+			// 3M and 4H are derived layers. Rebuild them after any recovery pass
+			// so the analytical hierarchy becomes coherent immediately.
+			await this.deriveThreeMinuteFromOneMinute();
+			await this.deriveFourHourFromOneHour();
+
+			const afterAudits: ContinuityAudit[] = [];
+			for (const interval of [
+				"1min",
+				"3min",
+				"5min",
+				"15min",
+				"30min",
+				"1h",
+				"4h",
+			] as AnalysisNormalizedInterval[]) {
+				afterAudits.push(await this.auditContinuity(interval));
+			}
+
+			const remainingProblems = afterAudits.filter(
+				(audit) => audit.gap !== null || !audit.effective_fresh,
+			);
+			const analysisReady =
+				isClosedMarketCairoDatetime(cairoTime(Date.now()))
+					? remainingProblems.every((audit) => audit.gap === null)
+					: remainingProblems.length === 0;
+
+			return {
+				status: "ok",
+				build_version: BUILD_VERSION,
+				symbol: SYMBOL,
+				timezone: TIMEZONE,
+				watchdog,
+				repair_requested: beforeAudits.some(
+					(audit) => audit.gap !== null || !audit.effective_fresh,
+				),
+				repair_status: analysisReady
+					? "ready"
+					: this.autoState!.queue.length > 0
+						? "queued_or_rate_limited"
+						: "partial",
+				analysis_ready: analysisReady,
+				before: beforeAudits,
+				after: afterAudits,
+				auto: this.publicAutoState(),
+			};
+		} catch (error) {
+			return {
+				status: "error",
+				build_version: BUILD_VERSION,
+				error: error instanceof Error ? error.message : String(error),
+				analysis_ready: false,
+			};
+		}
 	}
 
 	private updateScheduleAndEnqueue(nowMs: number) {
@@ -3468,7 +3847,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			const result = await this.syncHistoricalInterval(
 				item.interval,
 				item.outputsize,
-				null,
+				item.before ?? null,
 			);
 
 			if (result.status === "ok") {
@@ -3512,6 +3891,20 @@ export class Chat extends DurableObject<LiveEnv> {
 		// This does not consume Twelve Data API credits.
 		await this.ensureStorageMigration();
 
+		// Audit recovery on a bounded cadence, and immediately after any long
+		// period without a successful REST refresh. This avoids scanning the
+		// full recent effective chain on every one-minute alarm while still
+		// self-healing after a scheduler outage.
+		const recoveryAuditDue =
+			state.last_recovery_audit_ms == null ||
+			state.last_alarm_ms - state.last_recovery_audit_ms >=
+				AUTO_RECOVERY_AUDIT_INTERVAL_MS;
+		const restSuccessStale =
+			state.last_success_ms == null ||
+			state.last_alarm_ms - state.last_success_ms >= 10 * 60_000;
+		if (recoveryAuditDue || restSuccessStale) {
+			await this.enqueueStaleRecovery(state.last_alarm_ms);
+		}
 		this.updateScheduleAndEnqueue(state.last_alarm_ms);
 		await this.persistAutoState();
 
