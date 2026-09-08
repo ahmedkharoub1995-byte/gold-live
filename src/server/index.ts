@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v14-write-efficient-self-healing-2026-09-08";
+const BUILD_VERSION = "v14.1-write-efficient-quota-safe-read-2026-09-08";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -771,13 +771,27 @@ export class Chat extends DurableObject<LiveEnv> {
 					"bootstrap",
 				);
 				this.autoState.bootstrap_pending = true;
-				await ctx.storage.put(AUTO_STATE_KEY, this.autoState);
+				try {
+					await ctx.storage.put(AUTO_STATE_KEY, this.autoState);
+				} catch (error) {
+					// Keep the object readable even if today's write quota is exhausted.
+					this.lastError =
+						error instanceof Error ? error.message : String(error);
+				}
 			}
 
 			if (this.autoState.enabled) {
 				const alarm = await ctx.storage.getAlarm();
 				if (alarm === null) {
-					await ctx.storage.setAlarm(now + 1_000);
+					// Alarm re-arming is best-effort during construction. If the
+					// account has exhausted its Durable Object write quota, read-only
+					// endpoints must still remain available instead of failing with 1101.
+					try {
+						await ctx.storage.setAlarm(now + 1_000);
+					} catch (error) {
+						this.lastError =
+							error instanceof Error ? error.message : String(error);
+					}
 				}
 			}
 		});
@@ -786,9 +800,15 @@ export class Chat extends DurableObject<LiveEnv> {
 	async fetch(request: Request) {
 		const url = new URL(request.url);
 
-		// Read traffic itself acts as a watchdog. If Cloudflare ever loses or
-		// strands the Durable Object alarm, the next request re-arms it.
-		await this.ensureAutoWatchdog();
+		// Read traffic itself acts as a watchdog. Re-arming is best-effort:
+		// a depleted Durable Object write quota must not take read-only routes
+		// such as /system-check, /state, /price or /normalized-data offline.
+		try {
+			await this.ensureAutoWatchdog();
+		} catch (error) {
+			this.lastError =
+				error instanceof Error ? error.message : String(error);
+		}
 
 		if (url.pathname === "/start") {
 			this.enabled = true;
@@ -1400,7 +1420,15 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 
 		if (url.pathname === "/system-check") {
-			const migration = await this.ensureStorageMigration();
+			let migration: unknown;
+			try {
+				migration = await this.ensureStorageMigration();
+			} catch (error) {
+				migration = {
+					status: "error",
+					error: error instanceof Error ? error.message : String(error),
+				};
+			}
 			const frames = [];
 			for (const interval of [
 				"1min",
@@ -3442,12 +3470,25 @@ export class Chat extends DurableObject<LiveEnv> {
 
 		if (alarmMissingOrPast || alarmSuspiciouslyFar) {
 			const next = now + 1_000;
-			await this.ctx.storage.setAlarm(next);
-			return {
-				enabled: true,
-				rearmed: true,
-				scheduled_alarm_ms: next,
-			};
+			try {
+				await this.ctx.storage.setAlarm(next);
+				return {
+					enabled: true,
+					rearmed: true,
+					scheduled_alarm_ms: next,
+					write_error: null as string | null,
+				};
+			} catch (error) {
+				const message =
+					error instanceof Error ? error.message : String(error);
+				this.lastError = message;
+				return {
+					enabled: true,
+					rearmed: false,
+					scheduled_alarm_ms: scheduled,
+					write_error: message,
+				};
+			}
 		}
 
 		return {
