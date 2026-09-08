@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v12-self-healing-data-recovery-2026-09-08";
+const BUILD_VERSION = "v13-boundary-and-4h-recovery-2026-09-08";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -220,6 +220,9 @@ type ContinuityAudit = {
 	latest_confirmed_datetime: string | null;
 	current_provisional_datetime: string | null;
 	gap: ContinuityGap | null;
+	// A known provider/session-boundary omission that is recorded but does not
+	// block analysis readiness. We never synthesize a candle for it.
+	boundary_omission: ContinuityGap | null;
 	effective_fresh: boolean;
 };
 
@@ -3459,6 +3462,27 @@ export class Chat extends DurableObject<LiveEnv> {
 		);
 	}
 
+	private isNonBlockingBoundaryOmission(gap: ContinuityGap) {
+		// Twelve Data can occasionally omit the final 1M candle immediately
+		// before the declared 00:00 Cairo daily closure. The derived 3M bucket
+		// ending at that same boundary can then be incomplete as a consequence.
+		// Record that omission, but do not invent/synthesize it and do not let it
+		// block an otherwise complete current-session analysis.
+		if (gap.interval !== "1min" && gap.interval !== "3min") return false;
+		if (gap.missing_buckets !== 1) return false;
+
+		const duration = this.continuityIntervalMinutes(gap.interval);
+		const missingExpectedClose = addMinutesToCairoDatetime(
+			gap.missing_to,
+			duration,
+		);
+
+		return (
+			isClosedMarketCairoDatetime(missingExpectedClose) &&
+			hasDeclaredClosureBetween(missingExpectedClose, gap.after_datetime)
+		);
+	}
+
 	private async auditContinuity(
 		interval: AnalysisNormalizedInterval,
 	): Promise<ContinuityAudit> {
@@ -3466,9 +3490,12 @@ export class Chat extends DurableObject<LiveEnv> {
 		const confirmed = rows.filter((row) => row.confirmed === true);
 		const provisional = rows.filter((row) => row.provisional === true);
 		let gap: ContinuityGap | null = null;
+		let boundaryOmission: ContinuityGap | null = null;
 
-		// Find the newest actual market-hours gap. Normal daily/weekend closure
-		// buckets are ignored by countMissingMarketBuckets().
+		// Find the newest blocking market-hours gap. Normal daily/weekend closure
+		// buckets are ignored by countMissingMarketBuckets(). A single known
+		// 1M/derived-3M boundary omission is recorded separately and scanning
+		// continues so it can never hide an older real gap.
 		for (let i = rows.length - 2; i >= 0; i--) {
 			const before = rows[i];
 			const after = rows[i + 1];
@@ -3478,7 +3505,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				interval,
 			);
 			if (missing.count > 0 && missing.first && missing.last) {
-				gap = {
+				const candidate: ContinuityGap = {
 					interval,
 					before_datetime: before.datetime,
 					missing_from: missing.first,
@@ -3488,6 +3515,13 @@ export class Chat extends DurableObject<LiveEnv> {
 					missing_market_minutes:
 						missing.count * this.continuityIntervalMinutes(interval),
 				};
+
+				if (this.isNonBlockingBoundaryOmission(candidate)) {
+					if (boundaryOmission === null) boundaryOmission = candidate;
+					continue;
+				}
+
+				gap = candidate;
 				break;
 			}
 		}
@@ -3512,6 +3546,7 @@ export class Chat extends DurableObject<LiveEnv> {
 					? provisional[provisional.length - 1].datetime
 					: null,
 			gap,
+			boundary_omission: boundaryOmission,
 			effective_fresh: effectiveFresh,
 		};
 	}
@@ -3600,6 +3635,25 @@ export class Chat extends DurableObject<LiveEnv> {
 				);
 			}
 		}
+
+		// 4H is derived from confirmed 1H. A missing closed 4H bucket can exist
+		// even when 1H Effective looks fresh because the newest hours are still
+		// provisional. In that case force a targeted 1H REST refresh ending at
+		// the next existing 4H bucket, then the normal post-refresh derivation
+		// rebuilds 4H from authoritative 1H history.
+		const fourHourAudit = await this.auditContinuity("4h");
+		if (fourHourAudit.gap) {
+			const oneHourAudit = await this.auditContinuity("1h");
+			this.enqueueAutoRepair(
+				"1h",
+				this.recoveryOutputsizeForStaleness(
+					"1h",
+					oneHourAudit.latest_confirmed_datetime,
+				),
+				fourHourAudit.gap.after_datetime,
+				"auto_recovery_4h_source_backfill",
+			);
+		}
 	}
 
 	private async ensureGoldDataReady() {
@@ -3632,6 +3686,25 @@ export class Chat extends DurableObject<LiveEnv> {
 						"gpt_recovery_backfill",
 					);
 				}
+			}
+
+			// Include 4H in the pre-repair audit. 4H is derived, so a missing
+			// closed 4H bucket must be repaired through its authoritative 1H source.
+			const fourHourBefore = await this.auditContinuity("4h");
+			beforeAudits.push(fourHourBefore);
+			if (fourHourBefore.gap) {
+				const oneHourBefore = beforeAudits.find(
+					(audit) => audit.interval === "1h",
+				) ?? await this.auditContinuity("1h");
+				this.enqueueAutoRepair(
+					"1h",
+					this.recoveryOutputsizeForStaleness(
+						"1h",
+						oneHourBefore.latest_confirmed_datetime,
+					),
+					fourHourBefore.gap.after_datetime,
+					"gpt_recovery_4h_source_backfill",
+				);
 			}
 
 			await this.persistAutoState();
