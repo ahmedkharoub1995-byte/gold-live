@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v13-boundary-and-4h-recovery-2026-09-08";
+const BUILD_VERSION = "v14-write-efficient-self-healing-2026-09-08";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -193,6 +193,48 @@ type Derived4HMeta = {
 	pending_closed_period: boolean;
 	layer: "analysis_normalized";
 };
+
+
+function sameStoredHistoricalCandle(
+	a: StoredHistoricalCandle | null | undefined,
+	b: StoredHistoricalCandle,
+) {
+	return Boolean(
+		a &&
+			a.timeframe === b.timeframe &&
+			a.datetime === b.datetime &&
+			a.open === b.open &&
+			a.high === b.high &&
+			a.low === b.low &&
+			a.close === b.close &&
+			a.source === b.source &&
+			a.provisional === b.provisional &&
+			a.confirmed === b.confirmed
+	);
+}
+
+function sameNormalizedCandle(
+	a: NormalizedCandle | null | undefined,
+	b: NormalizedCandle,
+) {
+	return Boolean(
+		a &&
+			a.timeframe === b.timeframe &&
+			a.datetime === b.datetime &&
+			a.open_time === b.open_time &&
+			a.expected_close_time === b.expected_close_time &&
+			a.open === b.open &&
+			a.high === b.high &&
+			a.low === b.low &&
+			a.close === b.close &&
+			a.status === b.status &&
+			a.source === b.source &&
+			a.provisional === b.provisional &&
+			a.confirmed === b.confirmed &&
+			a.synthetic_gap === b.synthetic_gap &&
+			a.gap_adjusted === b.gap_adjusted
+	);
+}
 
 type AutoQueueItem = {
 	interval: RestInterval;
@@ -1595,7 +1637,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				current_effective_chain:
 					"WebSocket -> 1min -> intraday provisional -> 4h from effective 15min -> daily from effective 1h -> weekly/monthly from effective daily",
 				auto_refresh:
-					"Durable Object alarm queue, rate-budgeted and incremental; weekly maintenance refreshes every timeframe automatically",
+					"Durable Object alarm queue, rate-budgeted and write-efficient; overlapping REST/normalized rows use diff-upsert and derived layers are updated incrementally",
 				analysis:
 					"ChatGPT only — Worker does not detect FVG, liquidity, sweeps, mitigation, or market structure",
 			},
@@ -2171,6 +2213,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 	}
 
+
 	private async syncHistoricalInterval(
 		interval: RestInterval,
 		outputsize: number,
@@ -2198,13 +2241,10 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			const now = Date.now();
 			const validRows: StoredHistoricalCandle[] = [];
-
 			const rowsToStore = payload.candles.slice(0, outputsize);
 
 			for (const row of rowsToStore) {
-				if (!Array.isArray(row) || row.length < 5) {
-					continue;
-				}
+				if (!Array.isArray(row) || row.length < 5) continue;
 
 				const datetime = String(row[0] ?? "");
 				const open = parseFiniteNumber(row[1]);
@@ -2236,20 +2276,30 @@ export class Chat extends DurableObject<LiveEnv> {
 				});
 			}
 
-			for (let i = 0; i < validRows.length; i += 100) {
-				const batch = validRows.slice(i, i + 100);
-				const entries: Record<string, StoredHistoricalCandle> = {};
-
-				for (const candle of batch) {
-					entries[
-						historicalCandleKey(
-							interval,
-							candle.datetime,
-						)
-					] = candle;
+			// v14 write-efficiency: REST pages heavily overlap by design. Compare
+			// deterministic candle content and write only genuinely new/changed rows.
+			const changedEntries: Record<string, StoredHistoricalCandle> = {};
+			let unchangedRows = 0;
+			for (const candle of validRows) {
+				const key = historicalCandleKey(interval, candle.datetime);
+				const existing =
+					(await this.ctx.storage.get<StoredHistoricalCandle>(key)) ?? null;
+				if (sameStoredHistoricalCandle(existing, candle)) {
+					unchangedRows++;
+					continue;
 				}
+				changedEntries[key] = candle;
+			}
 
-				await this.ctx.storage.put(entries);
+			const changedKeys = Object.keys(changedEntries);
+			for (let i = 0; i < changedKeys.length; i += 100) {
+				const entries: Record<string, StoredHistoricalCandle> = {};
+				for (const key of changedKeys.slice(i, i + 100)) {
+					entries[key] = changedEntries[key];
+				}
+				if (Object.keys(entries).length > 0) {
+					await this.ctx.storage.put(entries);
+				}
 			}
 
 			const existingMeta =
@@ -2258,14 +2308,9 @@ export class Chat extends DurableObject<LiveEnv> {
 				)) ?? null;
 
 			const datetimes = validRows.map((c) => c.datetime).sort();
-
-			const requestOldest =
-				datetimes.length > 0 ? datetimes[0] : null;
-
+			const requestOldest = datetimes.length > 0 ? datetimes[0] : null;
 			const requestNewest =
-				datetimes.length > 0
-					? datetimes[datetimes.length - 1]
-					: null;
+				datetimes.length > 0 ? datetimes[datetimes.length - 1] : null;
 
 			const oldestDatetime = [
 				existingMeta?.oldest_datetime ?? null,
@@ -2278,9 +2323,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				existingMeta?.latest_datetime ?? null,
 				requestNewest,
 			].filter((v): v is string => v !== null);
-
-			const latestDatetime =
-				newestCandidates.sort().reverse()[0] ?? null;
+			const latestDatetime = newestCandidates.sort().reverse()[0] ?? null;
 
 			const meta: HistoricalMeta = {
 				timeframe: interval,
@@ -2294,10 +2337,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				source: "historical_rest",
 			};
 
-			await this.ctx.storage.put(
-				historicalMetaKey(interval),
-				meta,
-			);
+			// One metadata write per actual REST call is intentional and bounded.
+			await this.ctx.storage.put(historicalMetaKey(interval), meta);
 
 			return {
 				status: "ok",
@@ -2306,7 +2347,9 @@ export class Chat extends DurableObject<LiveEnv> {
 				requested_outputsize: outputsize,
 				rows_received: payload.candles.length,
 				rows_considered_after_requested_limit: rowsToStore.length,
-				rows_validated_and_stored: validRows.length,
+				rows_validated: validRows.length,
+				rows_written: changedKeys.length,
+				rows_unchanged_skipped: unchangedRows,
 				request_newest: requestNewest,
 				request_oldest: requestOldest,
 				stored_latest_datetime: latestDatetime,
@@ -2314,6 +2357,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				next_before: meta.next_before,
 				dedupe_key: "interval + datetime",
 				storage_layer: "raw_rest_persistent",
+				write_policy: "diff_upsert_only",
 				analysis_performed: false,
 			};
 		} catch (error) {
@@ -2326,6 +2370,85 @@ export class Chat extends DurableObject<LiveEnv> {
 						: String(error),
 			};
 		}
+	}
+
+
+	private async upsertNormalizedCandidates(
+		candidates: NormalizedCandle[],
+	) {
+		let written = 0;
+		let unchanged = 0;
+		const changed: Record<string, NormalizedCandle> = {};
+
+		for (const candle of candidates) {
+			const key = normalizedCandleKey(candle.timeframe, candle.datetime);
+			const existing =
+				(await this.ctx.storage.get<NormalizedCandle>(key)) ?? null;
+			if (sameNormalizedCandle(existing, candle)) {
+				unchanged++;
+				continue;
+			}
+			changed[key] = candle;
+		}
+
+		const keys = Object.keys(changed);
+		for (let i = 0; i < keys.length; i += 100) {
+			const entries: Record<string, NormalizedCandle> = {};
+			for (const key of keys.slice(i, i + 100)) {
+				entries[key] = changed[key];
+			}
+			if (Object.keys(entries).length > 0) {
+				await this.ctx.storage.put(entries);
+				written += Object.keys(entries).length;
+			}
+		}
+
+		return { written, unchanged };
+	}
+
+	private async reconcileNormalizedRange(
+		interval: AnalysisNormalizedInterval,
+		candidates: NormalizedCandle[],
+		fromDatetime: string | null,
+		toDatetime: string | null,
+	) {
+		const stats = await this.upsertNormalizedCandidates(candidates);
+		if (!fromDatetime || !toDatetime) {
+			return { ...stats, deleted: 0 };
+		}
+
+		const keep = new Set(candidates.map((c) => c.datetime));
+		const deleteKeys: string[] = [];
+		let startAfter: string | undefined;
+
+		while (true) {
+			const page = await this.ctx.storage.list<NormalizedCandle>({
+				prefix: normalizedPrefix(interval),
+				limit: 1000,
+				...(startAfter ? { startAfter } : {}),
+			});
+			if (page.size === 0) break;
+
+			for (const [key, candle] of page.entries()) {
+				if (
+					candle.datetime >= fromDatetime &&
+					candle.datetime <= toDatetime &&
+					!keep.has(candle.datetime)
+				) {
+					deleteKeys.push(key);
+				}
+			}
+
+			if (page.size < 1000) break;
+			const keys = Array.from(page.keys()) as string[];
+			startAfter = keys[keys.length - 1];
+		}
+
+		for (let i = 0; i < deleteKeys.length; i += 100) {
+			await this.ctx.storage.delete(deleteKeys.slice(i, i + 100));
+		}
+
+		return { ...stats, deleted: deleteKeys.length };
 	}
 
 	private async normalizeStoredInterval(
@@ -2478,46 +2601,16 @@ export class Chat extends DurableObject<LiveEnv> {
 				pendingClosedPeriod = true;
 			}
 
-			// Rebuild only this normalized timeframe. This also removes any
-			// legacy standalone synthetic-gap rows left by older versions.
-			while (true) {
-				const oldPage =
-					await this.ctx.storage.list<NormalizedCandle>({
-						prefix: normalizedPrefix(interval),
-						limit: 500,
-					});
-
-				if (oldPage.size === 0) {
-					break;
-				}
-
-				const keys = Array.from(oldPage.keys());
-
-				for (let i = 0; i < keys.length; i += 100) {
-					await this.ctx.storage.delete(
-						keys.slice(i, i + 100),
-					);
-				}
-			}
-
-			for (let i = 0; i < normalized.length; i += 100) {
-				const batch = normalized.slice(i, i + 100);
-				const entries: Record<
-					string,
-					NormalizedCandle
-				> = {};
-
-				for (const candle of batch) {
-					entries[
-						normalizedCandleKey(
-							interval,
-							candle.datetime,
-						)
-					] = candle;
-				}
-
-				await this.ctx.storage.put(entries);
-			}
+			// v14: reconcile by content. Existing identical rows are left untouched;
+			// obsolete rows inside the source range are removed selectively.
+			const sourceFrom = raw.length > 0 ? raw[0].datetime : null;
+			const sourceTo = raw.length > 0 ? raw[raw.length - 1].datetime : null;
+			const writeStats = await this.reconcileNormalizedRange(
+				interval,
+				normalized,
+				sourceFrom,
+				sourceTo,
+			);
 
 			const datetimes = normalized
 				.map((c) => c.datetime)
@@ -2567,6 +2660,9 @@ export class Chat extends DurableObject<LiveEnv> {
 				synthetic_gap_rows: 0,
 				pending_closed_period: pendingClosedPeriod,
 				normalized_rows_stored: normalized.length,
+				rows_written: writeStats.written,
+				rows_unchanged_skipped: writeStats.unchanged,
+				rows_deleted: writeStats.deleted,
 				oldest_datetime: meta.oldest_datetime,
 				latest_datetime: meta.latest_datetime,
 				analysis_performed: false,
@@ -2731,46 +2827,19 @@ export class Chat extends DurableObject<LiveEnv> {
 				a.datetime.localeCompare(b.datetime),
 			);
 
-			// Rebuild only the derived 3min layer, removing any legacy
-			// standalone synthetic-gap rows from older versions.
-			while (true) {
-				const oldPage =
-					await this.ctx.storage.list<NormalizedCandle>({
-						prefix: normalizedPrefix("3min"),
-						limit: 500,
-					});
-
-				if (oldPage.size === 0) {
-					break;
-				}
-
-				const keys = Array.from(oldPage.keys());
-
-				for (let i = 0; i < keys.length; i += 100) {
-					await this.ctx.storage.delete(
-						keys.slice(i, i + 100),
-					);
-				}
-			}
-
-			for (let i = 0; i < derived.length; i += 100) {
-				const batch = derived.slice(i, i + 100);
-				const entries: Record<
-					string,
-					NormalizedCandle
-				> = {};
-
-				for (const candle of batch) {
-					entries[
-						normalizedCandleKey(
-							"3min",
-							candle.datetime,
-						)
-					] = candle;
-				}
-
-				await this.ctx.storage.put(entries);
-			}
+			// v14: diff/reconcile the derived layer instead of delete-all/rewrite-all.
+			const sourceFrom = source.length > 0
+				? threeMinuteBucketStart(source[0].datetime)
+				: null;
+			const sourceTo = source.length > 0
+				? threeMinuteBucketStart(source[source.length - 1].datetime)
+				: null;
+			const writeStats = await this.reconcileNormalizedRange(
+				"3min",
+				derived,
+				sourceFrom,
+				sourceTo,
+			);
 
 			const datetimes = derived
 				.map((c) => c.datetime)
@@ -2828,6 +2897,9 @@ export class Chat extends DurableObject<LiveEnv> {
 				pending_closed_period:
 					meta.pending_closed_period,
 				normalized_rows_stored: derived.length,
+				rows_written: writeStats.written,
+				rows_unchanged_skipped: writeStats.unchanged,
+				rows_deleted: writeStats.deleted,
 				oldest_datetime: meta.oldest_datetime,
 				latest_datetime: meta.latest_datetime,
 				analysis_performed: false,
@@ -3021,46 +3093,19 @@ export class Chat extends DurableObject<LiveEnv> {
 				completeBuckets++;
 			}
 
-			// Rebuild only the derived 4h normalized layer, removing any
-			// legacy standalone-gap representation from older versions.
-			while (true) {
-				const oldPage =
-					await this.ctx.storage.list<NormalizedCandle>({
-						prefix: normalizedPrefix("4h"),
-						limit: 500,
-					});
-
-				if (oldPage.size === 0) {
-					break;
-				}
-
-				const keys = Array.from(oldPage.keys());
-
-				for (let i = 0; i < keys.length; i += 100) {
-					await this.ctx.storage.delete(
-						keys.slice(i, i + 100),
-					);
-				}
-			}
-
-			for (let i = 0; i < derived.length; i += 100) {
-				const batch = derived.slice(i, i + 100);
-				const entries: Record<
-					string,
-					NormalizedCandle
-				> = {};
-
-				for (const candle of batch) {
-					entries[
-						normalizedCandleKey(
-							"4h",
-							candle.datetime,
-						)
-					] = candle;
-				}
-
-				await this.ctx.storage.put(entries);
-			}
+			// v14: diff/reconcile only changed 4H buckets; never wipe the full layer.
+			const sourceFrom = source.length > 0
+				? fourHourBucketStart(source[0].datetime)
+				: null;
+			const sourceTo = source.length > 0
+				? fourHourBucketStart(source[source.length - 1].datetime)
+				: null;
+			const writeStats = await this.reconcileNormalizedRange(
+				"4h",
+				derived,
+				sourceFrom,
+				sourceTo,
+			);
 
 			const datetimes = derived
 				.map((c) => c.datetime)
@@ -3121,6 +3166,9 @@ export class Chat extends DurableObject<LiveEnv> {
 				pending_closed_period:
 					meta.pending_closed_period,
 				normalized_rows_stored: derived.length,
+				rows_written: writeStats.written,
+				rows_unchanged_skipped: writeStats.unchanged,
+				rows_deleted: writeStats.deleted,
 				oldest_datetime: meta.oldest_datetime,
 				latest_datetime: meta.latest_datetime,
 				analysis_performed: false,
@@ -3656,12 +3704,14 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 	}
 
+
 	private async ensureGoldDataReady() {
 		try {
 			const watchdog = await this.ensureAutoWatchdog();
 			await this.ensureConnection();
 			await this.ensureStorageMigration();
 			this.ensureAutoState();
+			const autoWasEnabled = this.autoState!.enabled;
 			this.autoState!.enabled = true;
 
 			const beforeAudits: ContinuityAudit[] = [];
@@ -3688,14 +3738,18 @@ export class Chat extends DurableObject<LiveEnv> {
 				}
 			}
 
-			// Include 4H in the pre-repair audit. 4H is derived, so a missing
-			// closed 4H bucket must be repaired through its authoritative 1H source.
+			// Derived 3M is audited explicitly but repaired locally from 1M.
+			const threeMinuteBefore = await this.auditContinuity("3min");
+			beforeAudits.push(threeMinuteBefore);
+
+			// 4H is derived from confirmed 1H. If a closed 4H bucket is missing,
+			// force a targeted authoritative 1H refresh around that boundary.
 			const fourHourBefore = await this.auditContinuity("4h");
 			beforeAudits.push(fourHourBefore);
 			if (fourHourBefore.gap) {
-				const oneHourBefore = beforeAudits.find(
-					(audit) => audit.interval === "1h",
-				) ?? await this.auditContinuity("1h");
+				const oneHourBefore =
+					beforeAudits.find((audit) => audit.interval === "1h") ??
+					await this.auditContinuity("1h");
 				this.enqueueAutoRepair(
 					"1h",
 					this.recoveryOutputsizeForStaleness(
@@ -3707,14 +3761,42 @@ export class Chat extends DurableObject<LiveEnv> {
 				);
 			}
 
-			await this.persistAutoState();
-			await this.processAutoQueue();
-			await this.scheduleAutoAlarm();
+			const oneMinuteBefore = beforeAudits.find(
+				(audit) => audit.interval === "1min",
+			) ?? null;
+			const oneHourBefore = beforeAudits.find(
+				(audit) => audit.interval === "1h",
+			) ?? null;
+			const threeMinuteNeedsRebuild =
+				threeMinuteBefore.gap !== null ||
+				!threeMinuteBefore.effective_fresh ||
+				oneMinuteBefore?.gap !== null ||
+				oneMinuteBefore?.effective_fresh === false;
+			const fourHourNeedsRebuild =
+				fourHourBefore.gap !== null ||
+				!fourHourBefore.effective_fresh ||
+				oneHourBefore?.gap !== null ||
+				oneHourBefore?.effective_fresh === false;
 
-			// 3M and 4H are derived layers. Rebuild them after any recovery pass
-			// so the analytical hierarchy becomes coherent immediately.
-			await this.deriveThreeMinuteFromOneMinute();
-			await this.deriveFourHourFromOneHour();
+			const repairRequested = beforeAudits.some(
+				(audit) => audit.gap !== null || !audit.effective_fresh,
+			);
+
+			const queueHasWork = this.autoState!.queue.length > 0;
+			if (repairRequested || queueHasWork || !autoWasEnabled) {
+				await this.persistAutoState();
+				await this.processAutoQueue();
+				await this.scheduleAutoAlarm();
+			}
+
+			// v14 read-first readiness: if no source/derived problem exists, do NOT
+			// rebuild 3M/4H merely because the GPT asked for readiness.
+			if (threeMinuteNeedsRebuild) {
+				await this.deriveThreeMinuteFromOneMinute();
+			}
+			if (fourHourNeedsRebuild) {
+				await this.deriveFourHourFromOneHour();
+			}
 
 			const afterAudits: ContinuityAudit[] = [];
 			for (const interval of [
@@ -3743,9 +3825,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				symbol: SYMBOL,
 				timezone: TIMEZONE,
 				watchdog,
-				repair_requested: beforeAudits.some(
-					(audit) => audit.gap !== null || !audit.effective_fresh,
-				),
+				repair_requested: repairRequested,
 				repair_status: analysisReady
 					? "ready"
 					: this.autoState!.queue.length > 0
@@ -3755,6 +3835,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				before: beforeAudits,
 				after: afterAudits,
 				auto: this.publicAutoState(),
+				write_policy: "read_first_diff_upsert",
 			};
 		} catch (error) {
 			return {
@@ -3886,7 +3967,11 @@ export class Chat extends DurableObject<LiveEnv> {
 			}
 
 			if (item.interval === "1h") {
-				await this.deriveFourHourFromOneHour();
+				if (bootstrap) {
+					await this.deriveFourHourFromOneHour();
+				} else {
+					await this.deriveRecentFourHourFromOneHour();
+				}
 			}
 			return;
 		}
@@ -4005,6 +4090,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		await this.scheduleAutoAlarm(delay);
 	}
 
+
 	private async normalizeRecentStoredInterval(
 		interval: NormalizedRestInterval,
 	) {
@@ -4017,18 +4103,14 @@ export class Chat extends DurableObject<LiveEnv> {
 		const raw = Array.from(page.values()).sort((a, b) =>
 			a.datetime.localeCompare(b.datetime),
 		);
-
-		if (raw.length === 0) {
-			return;
-		}
+		if (raw.length === 0) return;
 
 		const earliest = raw[0].datetime;
-		const priorPage =
-			await this.ctx.storage.list<NormalizedCandle>({
-				prefix: normalizedPrefix(interval),
-				reverse: true,
-				limit: 400,
-			});
+		const priorPage = await this.ctx.storage.list<NormalizedCandle>({
+			prefix: normalizedPrefix(interval),
+			reverse: true,
+			limit: 400,
+		});
 		const priorRows = Array.from(priorPage.values())
 			.filter((c) => c.datetime < earliest)
 			.sort((a, b) => b.datetime.localeCompare(a.datetime));
@@ -4037,6 +4119,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		let filtered = 0;
 		let gapAdjustedRows = 0;
 		let valid = 0;
+		const candidates: NormalizedCandle[] = [];
 
 		for (const candle of raw) {
 			if (isClosedMarketCairoDatetime(candle.datetime)) {
@@ -4048,9 +4131,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				candle.datetime,
 				durationMinutes,
 			);
-			if (statusFromExpectedClose(expectedCloseTime) === "OPEN") {
-				continue;
-			}
+			if (statusFromExpectedClose(expectedCloseTime) === "OPEN") continue;
 
 			const gapAdjusted =
 				previous !== null &&
@@ -4078,15 +4159,13 @@ export class Chat extends DurableObject<LiveEnv> {
 				gap_adjusted: gapAdjusted,
 				stored_at_ms: Date.now(),
 			};
-
-			await this.ctx.storage.put(
-				normalizedCandleKey(interval, candle.datetime),
-				normalized,
-			);
+			candidates.push(normalized);
 			previous = normalized;
 			valid++;
 			if (gapAdjusted) gapAdjustedRows++;
 		}
+
+		const writeStats = await this.upsertNormalizedCandidates(candidates);
 
 		const newest = await this.ctx.storage.list<NormalizedCandle>({
 			prefix: normalizedPrefix(interval),
@@ -4116,13 +4195,24 @@ export class Chat extends DurableObject<LiveEnv> {
 			layer: "analysis_normalized",
 		};
 		await this.ctx.storage.put(normalizedMetaKey(interval), meta);
+
+		return {
+			status: "ok",
+			interval,
+			rows_written: writeStats.written,
+			rows_unchanged_skipped: writeStats.unchanged,
+			write_policy: "diff_upsert_only",
+		};
 	}
 
+
 	private async deriveRecentThreeMinuteFromOneMinute() {
+		// Only a small tail is needed during routine 1M refreshes. Recovery uses
+		// the full diff-based derivation instead.
 		const page = await this.ctx.storage.list<NormalizedCandle>({
 			prefix: normalizedPrefix("1min"),
 			reverse: true,
-			limit: 360,
+			limit: 30,
 		});
 		const source = Array.from(page.values()).sort((a, b) =>
 			a.datetime.localeCompare(b.datetime),
@@ -4138,6 +4228,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			buckets.set(bucketStart, rows);
 		}
 
+		const candidates: NormalizedCandle[] = [];
 		for (const [bucketStart, rowsInput] of buckets) {
 			const rows = rowsInput.slice().sort((a, b) =>
 				a.datetime.localeCompare(b.datetime),
@@ -4157,7 +4248,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			const expectedClose = addMinutesToCairoDatetime(bucketStart, 3);
 			if (statusFromExpectedClose(expectedClose) === "OPEN") continue;
 
-			const candle: NormalizedCandle = {
+			candidates.push({
 				timeframe: "3min",
 				datetime: bucketStart,
 				open_time: bucketStart,
@@ -4173,12 +4264,82 @@ export class Chat extends DurableObject<LiveEnv> {
 				synthetic_gap: false,
 				gap_adjusted: rows.some((c) => c.gap_adjusted),
 				stored_at_ms: Date.now(),
-			};
-			await this.ctx.storage.put(
-				normalizedCandleKey("3min", bucketStart),
-				candle,
-			);
+			});
 		}
+
+		return await this.upsertNormalizedCandidates(candidates);
+	}
+
+	private async deriveRecentFourHourFromOneHour() {
+		// Routine 1H refresh only needs the most recent few 4H buckets.
+		const page = await this.ctx.storage.list<NormalizedCandle>({
+			prefix: normalizedPrefix("1h"),
+			reverse: true,
+			limit: 16,
+		});
+		const source = Array.from(page.values()).sort((a, b) =>
+			a.datetime.localeCompare(b.datetime),
+		);
+		if (source.length === 0) return;
+
+		const buckets = new Map<string, NormalizedCandle[]>();
+		for (const candle of source) {
+			const bucketStart = fourHourBucketStart(candle.datetime);
+			if (!bucketStart) continue;
+			const rows = buckets.get(bucketStart) ?? [];
+			rows.push(candle);
+			buckets.set(bucketStart, rows);
+		}
+
+		const candidates: NormalizedCandle[] = [];
+		for (const [bucketStart, rowsInput] of buckets) {
+			const parts = parseCairoDatetimeParts(bucketStart);
+			if (!parts) continue;
+			const rows = rowsInput.slice().sort((a, b) =>
+				a.datetime.localeCompare(b.datetime),
+			);
+			const expected = parts.hour === 0
+				? [
+					addMinutesToCairoDatetime(bucketStart, 60),
+					addMinutesToCairoDatetime(bucketStart, 120),
+					addMinutesToCairoDatetime(bucketStart, 180),
+				]
+				: [
+					bucketStart,
+					addMinutesToCairoDatetime(bucketStart, 60),
+					addMinutesToCairoDatetime(bucketStart, 120),
+					addMinutesToCairoDatetime(bucketStart, 180),
+				];
+			if (
+				rows.length !== expected.length ||
+				!expected.every((value, index) => rows[index]?.datetime === value)
+			) {
+				continue;
+			}
+			if (parts.hour === 0 && rows[0].gap_adjusted !== true) continue;
+
+			const expectedClose = addMinutesToCairoDatetime(bucketStart, 240);
+			if (statusFromExpectedClose(expectedClose) === "OPEN") continue;
+			candidates.push({
+				timeframe: "4h",
+				datetime: bucketStart,
+				open_time: bucketStart,
+				expected_close_time: expectedClose,
+				open: rows[0].open,
+				high: Math.max(...rows.map((c) => c.high)),
+				low: Math.min(...rows.map((c) => c.low)),
+				close: rows[rows.length - 1].close,
+				status: "CLOSED",
+				source: "derived_1h_gap_aware",
+				provisional: false,
+				confirmed: true,
+				synthetic_gap: false,
+				gap_adjusted: rows.some((c) => c.gap_adjusted),
+				stored_at_ms: Date.now(),
+			});
+		}
+
+		return await this.upsertNormalizedCandidates(candidates);
 	}
 
 	private async normalizeHigherNativeInterval(
@@ -4268,25 +4429,18 @@ export class Chat extends DurableObject<LiveEnv> {
 				if (gapAdjusted) gapAdjustedRows++;
 			}
 
-			while (true) {
-				const oldPage = await this.ctx.storage.list<NormalizedCandle>({
-					prefix: normalizedPrefix(interval),
-					limit: 500,
-				});
-				if (oldPage.size === 0) break;
-				const keys = Array.from(oldPage.keys());
-				for (let i = 0; i < keys.length; i += 100) {
-					await this.ctx.storage.delete(keys.slice(i, i + 100));
-				}
-			}
-
-			for (let i = 0; i < normalized.length; i += 100) {
-				const entries: Record<string, NormalizedCandle> = {};
-				for (const candle of normalized.slice(i, i + 100)) {
-					entries[normalizedCandleKey(interval, candle.datetime)] = candle;
-				}
-				await this.ctx.storage.put(entries);
-			}
+			const sourceFrom = normalized.length > 0
+				? normalized[0].datetime
+				: null;
+			const sourceTo = normalized.length > 0
+				? normalized[normalized.length - 1].datetime
+				: null;
+			const writeStats = await this.reconcileNormalizedRange(
+				interval,
+				normalized,
+				sourceFrom,
+				sourceTo,
+			);
 
 			const now = Date.now();
 			const meta: NormalizedMeta = {
@@ -4322,6 +4476,9 @@ export class Chat extends DurableObject<LiveEnv> {
 				gap_adjusted_rows: gapAdjustedRows,
 				synthetic_gap_rows: 0,
 				normalized_rows_stored: normalized.length,
+				rows_written: writeStats.written,
+				rows_unchanged_skipped: writeStats.unchanged,
+				rows_deleted: writeStats.deleted,
 				oldest_datetime: meta.oldest_datetime,
 				latest_datetime: meta.latest_datetime,
 				analysis_performed: false,
