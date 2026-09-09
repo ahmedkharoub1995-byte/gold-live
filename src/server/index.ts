@@ -3,14 +3,15 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v14.6-quota-guard-controlled-recovery-2026-09-09";
+const BUILD_VERSION = "v14.7-error-health-idle-write-optimization-2026-09-09";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
 
-// Recovery writes are intentionally budgeted far below Cloudflare's Free-tier
-// daily row-write ceiling. Normal live/current storage is NOT paused by this
-// budget; only bootstrap/backfill/recovery work is paused.
+// Recovery work uses an internal conservative reservation budget. It is NOT an
+// actual Cloudflare SQL-rows-written counter and does not write one row per
+// estimated candle. Normal live/current storage is NOT paused by this budget;
+// only bootstrap/backfill/recovery work is paused.
 const RECOVERY_BUDGET_KEY = "recovery_write_budget_v1";
 const RECOVERY_SOFT_LIMIT_ROWS = 25_000;
 const RECOVERY_HARD_CEILING_ROWS = 60_000;
@@ -24,7 +25,12 @@ const RECONNECT_MS = 5_000;
 const MAX_STORED_CANDLES = 480;
 
 const AUTO_STATE_KEY = "auto_refresh_state";
-const AUTO_ALARM_MS = 60_000;
+// v14.7: while the queue is busy we may need a one-minute follow-up because
+// of the Twelve Data rate window. When idle, the smallest REST cadence is
+// five minutes, so waking the Durable Object every minute only creates
+// unnecessary alarm/metadata writes.
+const AUTO_BUSY_ALARM_MS = 60_000;
+const AUTO_IDLE_ALARM_MS = 5 * 60_000;
 const AUTO_RATE_WINDOW_MS = 60_000;
 // Twelve Data Basic allows 8 API credits/minute. Keep one credit spare
 // for a manual request and process the rest automatically on the next alarm.
@@ -33,7 +39,7 @@ const AUTO_INCREMENTAL_OUTPUTSIZE = 12;
 const AUTO_BOOTSTRAP_OUTPUTSIZE = 1150;
 
 // Self-healing scheduler / continuity recovery.
-const AUTO_WATCHDOG_STALE_MS = 3 * 60_000;
+const AUTO_WATCHDOG_STALE_MS = 12 * 60_000;
 const RECOVERY_BUFFER_ROWS = 40;
 const RECOVERY_MAX_OUTPUTSIZE = 1150;
 const CONTINUITY_SCAN_CONFIRMED_LIMIT = 1000;
@@ -731,6 +737,12 @@ export class Chat extends DurableObject<LiveEnv> {
 	private candles: ProvisionalCandle[] = [];
 
 	private lastError: string | null = null;
+	// Storage-write health is tracked separately from WebSocket/provider errors.
+	// A historical quota error must never masquerade as a current runtime error.
+	private lastStorageWriteError: string | null = null;
+	private lastStorageWriteErrorMs: number | null = null;
+	private lastStorageWriteSuccessMs: number | null = null;
+	private historicalStorageWriteError: string | null = null;
 	private subscribeStatus: unknown = null;
 	private autoState: AutoRefreshState | null = null;
 
@@ -747,6 +759,10 @@ export class Chat extends DurableObject<LiveEnv> {
 				currentCandle?: ProvisionalCandle | null;
 				candles?: ProvisionalCandle[];
 				lastError?: string | null;
+				lastStorageWriteError?: string | null;
+				lastStorageWriteErrorMs?: number | null;
+				lastStorageWriteSuccessMs?: number | null;
+				historicalStorageWriteError?: string | null;
 				subscribeStatus?: unknown;
 			}>("live_state");
 
@@ -754,7 +770,29 @@ export class Chat extends DurableObject<LiveEnv> {
 				this.enabled = saved.enabled ?? true;
 				this.tickCount = saved.tickCount ?? 0;
 				this.reconnectCount = saved.reconnectCount ?? 0;
-				this.lastError = saved.lastError ?? null;
+
+				const savedLastError = saved.lastError ?? null;
+				this.lastStorageWriteError = saved.lastStorageWriteError ?? null;
+				this.lastStorageWriteErrorMs = saved.lastStorageWriteErrorMs ?? null;
+				this.lastStorageWriteSuccessMs = saved.lastStorageWriteSuccessMs ?? null;
+				this.historicalStorageWriteError =
+					saved.historicalStorageWriteError ?? null;
+
+				// v14.6 could persist a quota failure into live_state and then keep
+				// reporting it forever even after writes recovered. Migrate that legacy
+				// value to informational history without exposing it as current last_error.
+				if (
+					savedLastError !== null &&
+					this.isStorageWriteErrorMessage(savedLastError)
+				) {
+					// v14.6 had no timestamped storage-health fields, so this value is
+					// historical by definition after a v14.7 deploy. Do not promote it to
+					// current storage health. A new failed write will set a current error.
+					this.historicalStorageWriteError = savedLastError;
+					this.lastError = null;
+				} else {
+					this.lastError = savedLastError;
+				}
 				this.subscribeStatus = saved.subscribeStatus ?? null;
 
 				// Remove any live candles produced by older versions during
@@ -798,8 +836,16 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			if (savedAuto) {
 				this.autoState = savedAuto;
+				if (
+					this.autoState.last_error !== null &&
+					this.isStorageWriteErrorMessage(this.autoState.last_error)
+				) {
+					this.historicalStorageWriteError =
+						this.historicalStorageWriteError ?? this.autoState.last_error;
+					this.autoState.last_error = null;
+				}
 			} else {
-				// v14.6 controlled activation: deploy alone never starts bootstrap.
+				// Controlled activation remains preserved: deploy alone never starts bootstrap.
 				this.autoState = this.createInitialAutoState(nowCairo, now);
 				this.autoState.enabled = false;
 				this.autoState.queue = [];
@@ -824,6 +870,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				storage_write_attempted: false,
 				connection_status: this.connectionStatus,
 				last_error: this.lastError,
+				storage_write_health: this.storageWriteHealth(),
 			});
 		}
 
@@ -838,7 +885,7 @@ export class Chat extends DurableObject<LiveEnv> {
 					build_version: BUILD_VERSION,
 					object_name: this.objectName(),
 					note:
-						"Legacy Durable Object is retired. Production uses the v14.6 object.",
+						"Legacy Durable Object is retired. Production uses the current in-place object.",
 				},
 				410,
 			);
@@ -855,7 +902,7 @@ export class Chat extends DurableObject<LiveEnv> {
 					status: "blocked",
 					build_version: BUILD_VERSION,
 					error:
-						"Direct heavy maintenance is disabled in v14.6. Use guarded recovery.",
+						"Direct heavy maintenance is disabled. Use guarded recovery.",
 				},
 				403,
 			);
@@ -866,7 +913,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				return json(
 					{
 						status: "error",
-						error: "Activation is allowed only on the v14.6 production object.",
+						error: "Activation is allowed only on the current production object.",
 						object_name: this.objectName(),
 					},
 					409,
@@ -1298,7 +1345,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			const interval =
 				url.searchParams.get("interval") ?? "1h";
 
-			// v14.6: normalized-data is strictly read-only. Higher native
+			// normalized-data is strictly read-only. Higher native
 			// normalization is populated by guarded bootstrap/recovery.
 
 			if (!isAnalysisNormalizedInterval(interval)) {
@@ -1677,6 +1724,10 @@ export class Chat extends DurableObject<LiveEnv> {
 				storage_migration: migration,
 				scheduled_alarm_ms: scheduledAlarmMs,
 				auto: this.publicAutoState(),
+				runtime_health: {
+					current_last_error: this.lastError,
+					storage_write: this.storageWriteHealth(),
+				},
 				recovery_budget: await this.recoveryBudgetStatus(),
 				frames,
 				analysis_performed: false,
@@ -3424,6 +3475,72 @@ export class Chat extends DurableObject<LiveEnv> {
 	}
 
 
+	private isStorageWriteErrorMessage(value: unknown) {
+		if (value == null) return false;
+		const message = String(value);
+		return /(Exceeded allowed rows written|rows written in Durable Objects|Durable Objects free tier|storage\s*write|SQLITE.*write|quota.*write)/i.test(message);
+	}
+
+	private markStorageWriteFailure(error: unknown) {
+		const message = error instanceof Error ? error.message : String(error);
+		const now = Date.now();
+		this.lastStorageWriteError = message;
+		this.lastStorageWriteErrorMs = now;
+		this.historicalStorageWriteError = message;
+		this.lastError = message;
+		if (this.autoState) {
+			this.autoState.last_error = message;
+		}
+		return message;
+	}
+
+	private markStorageWriteSuccess(successMs = Date.now()) {
+		this.lastStorageWriteSuccessMs = successMs;
+		// Any successful Durable Object write proves a previously persisted
+		// write-quota error is no longer current. Keep it only as history.
+		if (this.lastStorageWriteError !== null) {
+			this.historicalStorageWriteError =
+				this.historicalStorageWriteError ?? this.lastStorageWriteError;
+		}
+		this.lastStorageWriteError = null;
+		this.lastStorageWriteErrorMs = null;
+		if (this.lastError !== null && this.isStorageWriteErrorMessage(this.lastError)) {
+			this.lastError = null;
+		}
+		if (
+			this.autoState?.last_error !== null &&
+			this.autoState?.last_error !== undefined &&
+			this.isStorageWriteErrorMessage(this.autoState.last_error)
+		) {
+			this.autoState.last_error = null;
+		}
+	}
+
+	private storageWriteHealth() {
+		const currentError = this.lastStorageWriteError;
+		return {
+			status: currentError !== null ? "degraded" : "healthy",
+			current_error: currentError,
+			current_error_time:
+				this.lastStorageWriteErrorMs !== null
+					? cairoTime(this.lastStorageWriteErrorMs)
+					: null,
+			last_success_time:
+				this.lastStorageWriteSuccessMs !== null
+					? cairoTime(this.lastStorageWriteSuccessMs)
+					: null,
+			historical_error: this.historicalStorageWriteError,
+			degradation_rule:
+				"Historical errors are informational only. Degrade only on a current failed Action/readiness failure or current storage_write_health=degraded.",
+		};
+	}
+
+	private autoStateFingerprint() {
+		this.ensureAutoState();
+		const { last_alarm_ms: _ignoredLastAlarm, ...stable } = this.autoState!;
+		return JSON.stringify(stable);
+	}
+
 	private objectName() {
 		return ((this.ctx.id as unknown as { name?: string | null }).name ?? null);
 	}
@@ -3488,6 +3605,8 @@ export class Chat extends DurableObject<LiveEnv> {
 		);
 		return {
 			...budget,
+			reserved_estimated_rows: budget.estimated_used_rows,
+			accounting_scope: "recovery_reservation_only_not_cloudflare_actual_usage",
 			effective_limit_rows: effectiveLimit,
 			remaining_estimated_rows: Math.max(
 				0,
@@ -3495,7 +3614,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			),
 			paused: budget.estimated_used_rows >= effectiveLimit,
 			note:
-				"Internal conservative recovery budget only. Live/current writes continue when recovery pauses.",
+				"Internal conservative recovery reservation only; it is not Cloudflare SQL rows written and does not increment per candle row. Live/current writes continue when recovery pauses.",
 		};
 	}
 
@@ -3817,33 +3936,46 @@ export class Chat extends DurableObject<LiveEnv> {
 				"1week_rest": "after Friday trading closes / Saturday 00:00 Cairo",
 				"1month_rest": "at the month boundary",
 				"3min_rest": "never; derived from effective 1min",
+				"scheduler_idle_wake": "every 5 minutes; busy/rate-window follow-up may use 1 minute",
 			},
 		};
 	}
 
 	private async persistAutoState() {
 		this.ensureAutoState();
+		const state = this.autoState!;
+		if (state.last_error !== null && this.isStorageWriteErrorMessage(state.last_error)) {
+			// A successful write below proves the old quota error is stale.
+			state.last_error = null;
+		}
 		try {
-			await this.ctx.storage.put(AUTO_STATE_KEY, this.autoState!);
+			await this.ctx.storage.put(AUTO_STATE_KEY, state);
+			this.markStorageWriteSuccess();
 			return true;
 		} catch (error) {
-			this.lastError =
-				error instanceof Error ? error.message : String(error);
+			this.markStorageWriteFailure(error);
 			return false;
 		}
 	}
 
-	private async scheduleAutoAlarm(delayMs = AUTO_ALARM_MS) {
+	private async persistAutoStateIfChanged(beforeFingerprint: string) {
+		if (this.autoStateFingerprint() === beforeFingerprint) {
+			return true;
+		}
+		return this.persistAutoState();
+	}
+
+	private async scheduleAutoAlarm(delayMs = AUTO_IDLE_ALARM_MS) {
 		this.ensureAutoState();
 		if (!this.autoState!.enabled) {
 			return false;
 		}
 		try {
 			await this.ctx.storage.setAlarm(Date.now() + delayMs);
+			this.markStorageWriteSuccess();
 			return true;
 		} catch (error) {
-			this.lastError =
-				error instanceof Error ? error.message : String(error);
+			this.markStorageWriteFailure(error);
 			return false;
 		}
 	}
@@ -3867,12 +3999,13 @@ export class Chat extends DurableObject<LiveEnv> {
 			now - state.last_alarm_ms > AUTO_WATCHDOG_STALE_MS;
 		const alarmMissingOrPast = scheduled === null || scheduled <= now;
 		const alarmSuspiciouslyFar =
-			stateStale && scheduled !== null && scheduled > now + 2 * AUTO_ALARM_MS;
+			stateStale && scheduled !== null && scheduled > now + 2 * AUTO_IDLE_ALARM_MS;
 
 		if (alarmMissingOrPast || alarmSuspiciouslyFar) {
 			const next = now + 1_000;
 			try {
 				await this.ctx.storage.setAlarm(next);
+				this.markStorageWriteSuccess();
 				return {
 					enabled: true,
 					rearmed: true,
@@ -3880,9 +4013,7 @@ export class Chat extends DurableObject<LiveEnv> {
 					write_error: null as string | null,
 				};
 			} catch (error) {
-				const message =
-					error instanceof Error ? error.message : String(error);
-				this.lastError = message;
+				const message = this.markStorageWriteFailure(error);
 				return {
 					enabled: true,
 					rearmed: false,
@@ -4453,7 +4584,12 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			state.queue.splice(itemIndex, 1);
 			state.rate_requests++;
-			await this.persistAutoState();
+			// For guarded recovery/bootstrap, checkpoint queue removal before heavy
+			// work. Routine current-cadence items are diff-upserts and are persisted
+			// once after processing, avoiding one metadata write per item.
+			if (this.isRecoveryWork(item)) {
+				await this.persistAutoState();
+			}
 
 			// Reserve the conservative estimate BEFORE any recovery writes happen.
 			// If the operation later fails, the reservation is intentionally not
@@ -4513,10 +4649,14 @@ export class Chat extends DurableObject<LiveEnv> {
 			if (!state.enabled) {
 				try {
 					await this.ctx.storage.deleteAlarm();
-				} catch {}
+					this.markStorageWriteSuccess();
+				} catch (error) {
+					this.markStorageWriteFailure(error);
+				}
 				return;
 			}
 
+			const beforeFingerprint = this.autoStateFingerprint();
 			state.last_alarm_ms = Date.now();
 
 			const recoveryAuditDue =
@@ -4537,17 +4677,24 @@ export class Chat extends DurableObject<LiveEnv> {
 			}
 
 			this.updateScheduleAndEnqueue(state.last_alarm_ms);
-			await this.persistAutoState();
 
 			try {
 				await this.ensureConnection();
-				await this.processAutoQueue();
+				if (state.queue.length > 0) {
+					await this.processAutoQueue();
+				} else {
+					// No queue work: persist only if something other than last_alarm_ms
+					// actually changed. This removes idle metadata writes.
+					await this.persistAutoStateIfChanged(beforeFingerprint);
+				}
 			} catch (error) {
 				state.last_error =
 					error instanceof Error ? error.message : String(error);
 				await this.persistAutoState();
 			}
 
+			const recoveryPaused =
+				state.last_error?.startsWith("RECOVERY_BUDGET_PAUSED") ?? false;
 			const delay =
 				state.queue.length > 0 &&
 				state.rate_requests >= AUTO_MAX_REQUESTS_PER_WINDOW
@@ -4558,7 +4705,9 @@ export class Chat extends DurableObject<LiveEnv> {
 							1_000 -
 							Date.now(),
 					)
-					: AUTO_ALARM_MS;
+					: state.queue.length > 0 && !recoveryPaused
+						? AUTO_BUSY_ALARM_MS
+						: AUTO_IDLE_ALARM_MS;
 
 			await this.scheduleAutoAlarm(delay);
 		} catch (error) {
@@ -5461,6 +5610,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			last_error:
 				this.lastError,
 
+			storage_write_health: this.storageWriteHealth(),
+
 			auto_refresh: this.publicAutoState(),
 
 			data_policy: {
@@ -5479,6 +5630,11 @@ export class Chat extends DurableObject<LiveEnv> {
 	}
 
 	private async persist() {
+		const successMs = Date.now();
+		const persistedLastError =
+			this.lastError !== null && this.isStorageWriteErrorMessage(this.lastError)
+				? null
+				: this.lastError;
 		try {
 			await this.ctx.storage.put("live_state", {
 				enabled: this.enabled,
@@ -5488,13 +5644,18 @@ export class Chat extends DurableObject<LiveEnv> {
 				reconnectCount: this.reconnectCount,
 				currentCandle: this.currentCandle,
 				candles: this.candles,
-				lastError: this.lastError,
+				lastError: persistedLastError,
+				lastStorageWriteError: null,
+				lastStorageWriteErrorMs: null,
+				lastStorageWriteSuccessMs: successMs,
+				historicalStorageWriteError: this.historicalStorageWriteError,
 				subscribeStatus: this.subscribeStatus,
 			});
+			this.lastError = persistedLastError;
+			this.markStorageWriteSuccess(successMs);
 			return true;
 		} catch (error) {
-			this.lastError =
-				error instanceof Error ? error.message : String(error);
+			this.markStorageWriteFailure(error);
 			return false;
 		}
 	}
@@ -5519,6 +5680,9 @@ export default {
 				retired_object_names: RETIRED_OBJECT_NAMES,
 				recovery_soft_limit_rows: RECOVERY_SOFT_LIMIT_ROWS,
 				recovery_hard_ceiling_rows: RECOVERY_HARD_CEILING_ROWS,
+				scheduler_idle_alarm_ms: AUTO_IDLE_ALARM_MS,
+				scheduler_busy_alarm_ms: AUTO_BUSY_ALARM_MS,
+				production_object_reused_in_place: true,
 				durable_object_touched: false,
 			});
 		}
