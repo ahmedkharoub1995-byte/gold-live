@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v14.2-write-efficient-quota-shield-2026-09-08";
+const BUILD_VERSION = "v14.3-strict-read-safe-runtime-reset-2026-09-09";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -764,6 +764,9 @@ export class Chat extends DurableObject<LiveEnv> {
 			if (savedAuto) {
 				this.autoState = savedAuto;
 			} else {
+				// IMPORTANT: constructor is read-only in v14.3.
+				// Build the default state in memory only. Persisting/re-arming is
+				// performed explicitly by /wake or by a later write-capable action.
 				this.autoState = this.createInitialAutoState(nowCairo, now);
 				this.enqueueAutoIntervals(
 					REST_INTERVALS,
@@ -771,43 +774,43 @@ export class Chat extends DurableObject<LiveEnv> {
 					"bootstrap",
 				);
 				this.autoState.bootstrap_pending = true;
-				try {
-					await ctx.storage.put(AUTO_STATE_KEY, this.autoState);
-				} catch (error) {
-					// Keep the object readable even if today's write quota is exhausted.
-					this.lastError =
-						error instanceof Error ? error.message : String(error);
-				}
 			}
 
-			if (this.autoState.enabled) {
-				const alarm = await ctx.storage.getAlarm();
-				if (alarm === null) {
-					// Alarm re-arming is best-effort during construction. If the
-					// account has exhausted its Durable Object write quota, read-only
-					// endpoints must still remain available instead of failing with 1101.
-					try {
-						await ctx.storage.setAlarm(now + 1_000);
-					} catch (error) {
-						this.lastError =
-							error instanceof Error ? error.message : String(error);
-					}
-				}
-			}
+			// Do not setAlarm() here. A Durable Object must be able to cold-start
+			// and answer diagnostic reads even when write quota enforcement is active.
 		});
 	}
 
 	async fetch(request: Request) {
 		const url = new URL(request.url);
 
-		// Read traffic itself acts as a watchdog. Re-arming is best-effort:
-		// a depleted Durable Object write quota must not take read-only routes
-		// such as /system-check, /state, /price or /normalized-data offline.
-		try {
-			await this.ensureAutoWatchdog();
-		} catch (error) {
-			this.lastError =
-				error instanceof Error ? error.message : String(error);
+		// v14.3 rule: ordinary reads never attempt a Durable Object write.
+		// Watchdog/alarm recovery is explicit through /wake and readiness flows.
+
+		if (url.pathname === "/wake") {
+			this.ensureAutoState();
+			this.autoState!.enabled = true;
+
+			// Clear only the in-memory diagnostic string. Old persisted errors do not
+			// control execution, but this makes the result easy to interpret.
+			this.lastError = null;
+			this.autoState!.last_error = null;
+
+			const statePersisted = await this.persistAutoState();
+			const alarmScheduled = await this.scheduleAutoAlarm(1_000);
+			const scheduledAlarmMs = await this.ctx.storage.getAlarm();
+
+			return json({
+				status:
+					statePersisted && alarmScheduled ? "ok" : "degraded",
+				build_version: BUILD_VERSION,
+				action: "wake",
+				state_persisted: statePersisted,
+				alarm_scheduled: alarmScheduled,
+				scheduled_alarm_ms: scheduledAlarmMs,
+				last_error: this.lastError,
+				auto: this.publicAutoState(),
+			});
 		}
 
 		if (url.pathname === "/start") {
@@ -1473,6 +1476,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				});
 			}
 
+			const scheduledAlarmMs = await this.ctx.storage.getAlarm();
+
 			return json({
 				status: "ok",
 				build_version: BUILD_VERSION,
@@ -1481,9 +1486,11 @@ export class Chat extends DurableObject<LiveEnv> {
 				market_closed: isClosedMarketCairoDatetime(cairoTime(Date.now())),
 				last_live_price: this.lastPrice,
 				storage_migration: migration,
+				scheduled_alarm_ms: scheduledAlarmMs,
 				auto: this.publicAutoState(),
 				frames,
 				analysis_performed: false,
+				read_only_route: true,
 			});
 		}
 
