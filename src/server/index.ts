@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v14.3-strict-read-safe-runtime-reset-2026-09-09";
+const BUILD_VERSION = "v14.4-fresh-instance-probe-2026-09-09";
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -784,7 +784,21 @@ export class Chat extends DurableObject<LiveEnv> {
 	async fetch(request: Request) {
 		const url = new URL(request.url);
 
-		// v14.3 rule: ordinary reads never attempt a Durable Object write.
+		// Zero-write instance probe. This route is used to distinguish an
+		// account/platform quota problem from one poisoned/stuck Durable Object
+		// instance. The constructor is read-only in v14.3+.
+		if (url.pathname === "/instance-probe") {
+			return json({
+				status: "ok",
+				build_version: BUILD_VERSION,
+				instance_probe: true,
+				storage_write_attempted: false,
+				connection_status: this.connectionStatus,
+				last_error: this.lastError,
+			});
+		}
+
+		// v14.3+ rule: ordinary reads never attempt a Durable Object write.
 		// Watchdog/alarm recovery is explicit through /wake and readiness flows.
 
 		if (url.pathname === "/wake") {
@@ -5134,6 +5148,51 @@ export default {
 				service: "Gold Data Engine outer worker",
 				durable_object_touched: false,
 			});
+		}
+
+		if (url.pathname === "/probe-fresh-do") {
+			try {
+				// Deliberately use a brand-new logical Durable Object ID. This does
+				// NOT replace production XAUUSD and does not touch its stored data.
+				const probeId = env.Chat.idFromName(
+					"XAUUSD_V14_4_FRESH_PROBE_20260909",
+				);
+				const probeStub = env.Chat.get(probeId);
+				const probeUrl = new URL(request.url);
+				probeUrl.pathname = "/instance-probe";
+				probeUrl.search = "";
+				return await probeStub.fetch(
+					new Request(probeUrl.toString(), {
+						method: "GET",
+						headers: request.headers,
+					}),
+				);
+			} catch (error) {
+				const anyError = error as {
+					message?: unknown;
+					name?: unknown;
+					remote?: unknown;
+					retryable?: unknown;
+					overloaded?: unknown;
+				};
+				return json(
+					{
+						status: "error",
+						build_version: BUILD_VERSION,
+						probe: "fresh_durable_object",
+						error:
+							anyError?.message != null
+								? String(anyError.message)
+								: String(error),
+						name:
+							anyError?.name != null ? String(anyError.name) : null,
+						remote: Boolean(anyError?.remote),
+						retryable: Boolean(anyError?.retryable),
+						overloaded: Boolean(anyError?.overloaded),
+					},
+					503,
+				);
+			}
 		}
 
 		try {
