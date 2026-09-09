@@ -3,7 +3,19 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v14.4-fresh-instance-probe-2026-09-09";
+const BUILD_VERSION = "v14.6-quota-guard-controlled-recovery-2026-09-09";
+const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
+const LEGACY_OBJECT_NAME = "XAUUSD";
+const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
+
+// Recovery writes are intentionally budgeted far below Cloudflare's Free-tier
+// daily row-write ceiling. Normal live/current storage is NOT paused by this
+// budget; only bootstrap/backfill/recovery work is paused.
+const RECOVERY_BUDGET_KEY = "recovery_write_budget_v1";
+const RECOVERY_SOFT_LIMIT_ROWS = 25_000;
+const RECOVERY_HARD_CEILING_ROWS = 60_000;
+const RECOVERY_MAX_MANUAL_ADD_ROWS = 25_000;
+const RECOVERY_COST_MULTIPLIER = 3;
 
 const HEARTBEAT_MS = 10_000;
 const RECONNECT_MS = 5_000;
@@ -54,6 +66,18 @@ const REST_INTERVALS = [
 ] as const;
 
 type RestInterval = (typeof REST_INTERVALS)[number];
+
+const BOOTSTRAP_OUTPUTSIZE_BY_INTERVAL: Record<RestInterval, number> = {
+	"1min": 1150,
+	"5min": 1150,
+	"15min": 1000,
+	"30min": 800,
+	"1h": 800,
+	"4h": 500,
+	"1day": 500,
+	"1week": 300,
+	"1month": 180,
+};
 
 const NORMALIZED_REST_INTERVALS = [
 	"1min",
@@ -286,6 +310,17 @@ type AutoRefreshState = {
 	bootstrap_pending: boolean;
 	last_recovery_audit_ms?: number | null;
 };
+
+type RecoveryBudgetState = {
+	utc_day: string;
+	estimated_used_rows: number;
+	soft_limit_rows: number;
+	manual_extra_rows: number;
+	hard_ceiling_rows: number;
+	last_update_ms: number;
+	last_reason: string | null;
+};
+
 
 type HistoricalWorkerPayload = {
 	status?: string;
@@ -764,20 +799,14 @@ export class Chat extends DurableObject<LiveEnv> {
 			if (savedAuto) {
 				this.autoState = savedAuto;
 			} else {
-				// IMPORTANT: constructor is read-only in v14.3.
-				// Build the default state in memory only. Persisting/re-arming is
-				// performed explicitly by /wake or by a later write-capable action.
+				// v14.6 controlled activation: deploy alone never starts bootstrap.
 				this.autoState = this.createInitialAutoState(nowCairo, now);
-				this.enqueueAutoIntervals(
-					REST_INTERVALS,
-					AUTO_BOOTSTRAP_OUTPUTSIZE,
-					"bootstrap",
-				);
-				this.autoState.bootstrap_pending = true;
+				this.autoState.enabled = false;
+				this.autoState.queue = [];
+				this.autoState.bootstrap_pending = false;
 			}
 
-			// Do not setAlarm() here. A Durable Object must be able to cold-start
-			// and answer diagnostic reads even when write quota enforcement is active.
+			// Constructor stays strictly read-only: no put(), no setAlarm().
 		});
 	}
 
@@ -798,18 +827,133 @@ export class Chat extends DurableObject<LiveEnv> {
 			});
 		}
 
-		// v14.3+ rule: ordinary reads never attempt a Durable Object write.
-		// Watchdog/alarm recovery is explicit through /wake and readiness flows.
+		if (url.pathname === "/retire-instance") {
+			return json(await this.retireThisInstance());
+		}
+
+		if (this.isRetiredInstance()) {
+			return json(
+				{
+					status: "retired",
+					build_version: BUILD_VERSION,
+					object_name: this.objectName(),
+					note:
+						"Legacy Durable Object is retired. Production uses the v14.6 object.",
+				},
+				410,
+			);
+		}
+
+		if (
+			url.pathname === "/sync" ||
+			url.pathname === "/normalize" ||
+			url.pathname === "/purge" ||
+			url.pathname === "/auto/run"
+		) {
+			return json(
+				{
+					status: "blocked",
+					build_version: BUILD_VERSION,
+					error:
+						"Direct heavy maintenance is disabled in v14.6. Use guarded recovery.",
+				},
+				403,
+			);
+		}
+
+		if (url.pathname === "/activate") {
+			if (!this.isProductionInstance()) {
+				return json(
+					{
+						status: "error",
+						error: "Activation is allowed only on the v14.6 production object.",
+						object_name: this.objectName(),
+					},
+					409,
+				);
+			}
+
+			this.ensureAutoState();
+			const state = this.autoState!;
+			state.enabled = true;
+			state.last_error = null;
+
+			if (state.queue.length === 0) {
+				this.enqueueBootstrapPlan();
+			}
+			state.bootstrap_pending = state.queue.some((item) =>
+				item.reason.includes("bootstrap"),
+			);
+
+			const persisted = await this.persistAutoState();
+			const alarmScheduled = await this.scheduleAutoAlarm(1_000);
+			return json({
+				status:
+					persisted && alarmScheduled ? "ok" : "degraded",
+				build_version: BUILD_VERSION,
+				action: "activate",
+				object_name: this.objectName(),
+				auto: this.publicAutoState(),
+				recovery_budget: await this.recoveryBudgetStatus(),
+			});
+		}
+
+		if (url.pathname === "/maintenance/recovery-budget") {
+			const addParam = url.searchParams.get("add");
+			if (addParam === null) {
+				return json({
+					status: "ok",
+					build_version: BUILD_VERSION,
+					recovery_budget: await this.recoveryBudgetStatus(),
+				});
+			}
+
+			const add = Number(addParam);
+			if (!Number.isInteger(add) || add <= 0) {
+				return json(
+					{
+						status: "error",
+						error: "add must be a positive integer number of estimated recovery rows.",
+					},
+					400,
+				);
+			}
+
+			const budget = await this.addRecoveryBudget(add);
+			if (this.autoState?.enabled) {
+				await this.scheduleAutoAlarm(1_000);
+			}
+			return json({
+				status: "ok",
+				build_version: BUILD_VERSION,
+				add_requested_rows: Math.min(
+					add,
+					RECOVERY_MAX_MANUAL_ADD_ROWS,
+				),
+				recovery_budget: budget,
+			});
+		}
+
+		// Ordinary reads never attempt a watchdog write before their route.
 
 		if (url.pathname === "/wake") {
 			this.ensureAutoState();
-			this.autoState!.enabled = true;
+			if (!this.autoState!.enabled) {
+				return json(
+					{
+						status: "inactive",
+						build_version: BUILD_VERSION,
+						action: "wake",
+						note:
+							"Production is intentionally inactive. Call /activate once.",
+						auto: this.publicAutoState(),
+					},
+					409,
+				);
+			}
 
-			// Clear only the in-memory diagnostic string. Old persisted errors do not
-			// control execution, but this makes the result easy to interpret.
 			this.lastError = null;
 			this.autoState!.last_error = null;
-
 			const statePersisted = await this.persistAutoState();
 			const alarmScheduled = await this.scheduleAutoAlarm(1_000);
 			const scheduledAlarmMs = await this.ctx.storage.getAlarm();
@@ -824,6 +968,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				scheduled_alarm_ms: scheduledAlarmMs,
 				last_error: this.lastError,
 				auto: this.publicAutoState(),
+				recovery_budget: await this.recoveryBudgetStatus(),
 			});
 		}
 
@@ -1153,9 +1298,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			const interval =
 				url.searchParams.get("interval") ?? "1h";
 
-			if (isHigherNativeInterval(interval)) {
-				await this.ensureStorageMigration();
-			}
+			// v14.6: normalized-data is strictly read-only. Higher native
+			// normalization is populated by guarded bootstrap/recovery.
 
 			if (!isAnalysisNormalizedInterval(interval)) {
 				return json(
@@ -1367,14 +1511,16 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 
 		if (url.pathname === "/auto/start") {
-			this.ensureAutoState();
-			this.autoState!.enabled = true;
-			await this.persistAutoState();
-			await this.ctx.storage.setAlarm(Date.now() + 1_000);
-			return json({
-				status: "ok",
-				auto: this.publicAutoState(),
-			});
+			return json(
+				{
+					status: "redirect",
+					build_version: BUILD_VERSION,
+					note:
+						"Use /activate once for controlled bootstrap, or /wake after activation.",
+					activate_path: "/activate",
+				},
+				409,
+			);
 		}
 
 		if (url.pathname === "/auto/stop") {
@@ -1432,8 +1578,30 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 
 		if (url.pathname === "/ensure-data-ready") {
+			this.ensureAutoState();
+			if (!this.autoState!.enabled) {
+				return json(
+					{
+						status: "inactive",
+						build_version: BUILD_VERSION,
+						analysis_ready: false,
+						repair_requested: false,
+						repair_status: "inactive_until_activate",
+						auto: this.publicAutoState(),
+						recovery_budget: await this.recoveryBudgetStatus(),
+					},
+					409,
+				);
+			}
+
 			const result = await this.ensureGoldDataReady();
-			return json(result, result.status === "error" ? 500 : 200);
+			return json(
+				{
+					...result,
+					recovery_budget: await this.recoveryBudgetStatus(),
+				},
+				result.status === "error" ? 500 : 200,
+			);
 		}
 
 		if (url.pathname === "/system-check") {
@@ -1497,11 +1665,19 @@ export class Chat extends DurableObject<LiveEnv> {
 				build_version: BUILD_VERSION,
 				symbol: SYMBOL,
 				timezone: TIMEZONE,
+				object_name: this.objectName(),
+				object_role:
+					this.isProductionInstance()
+						? "production"
+						: this.isRetiredInstance()
+							? "retired"
+							: "other",
 				market_closed: isClosedMarketCairoDatetime(cairoTime(Date.now())),
 				last_live_price: this.lastPrice,
 				storage_migration: migration,
 				scheduled_alarm_ms: scheduledAlarmMs,
 				auto: this.publicAutoState(),
+				recovery_budget: await this.recoveryBudgetStatus(),
 				frames,
 				analysis_performed: false,
 				read_only_route: true,
@@ -3247,12 +3423,191 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 	}
 
+
+	private objectName() {
+		return ((this.ctx.id as unknown as { name?: string | null }).name ?? null);
+	}
+
+	private isProductionInstance() {
+		return this.objectName() === PROD_OBJECT_NAME;
+	}
+
+	private isRetiredInstance() {
+		const name = this.objectName();
+		return name !== null &&
+			(RETIRED_OBJECT_NAMES as readonly string[]).includes(name);
+	}
+
+	private utcBudgetDay(ms = Date.now()) {
+		return new Date(ms).toISOString().slice(0, 10);
+	}
+
+	private newRecoveryBudget(now = Date.now()): RecoveryBudgetState {
+		return {
+			utc_day: this.utcBudgetDay(now),
+			estimated_used_rows: 0,
+			soft_limit_rows: RECOVERY_SOFT_LIMIT_ROWS,
+			manual_extra_rows: 0,
+			hard_ceiling_rows: RECOVERY_HARD_CEILING_ROWS,
+			last_update_ms: now,
+			last_reason: null,
+		};
+	}
+
+	private normalizedRecoveryBudget(
+		stored: RecoveryBudgetState | null,
+		now = Date.now(),
+	) {
+		const day = this.utcBudgetDay(now);
+		if (!stored || stored.utc_day !== day) {
+			return this.newRecoveryBudget(now);
+		}
+		return {
+			...stored,
+			soft_limit_rows: RECOVERY_SOFT_LIMIT_ROWS,
+			hard_ceiling_rows: RECOVERY_HARD_CEILING_ROWS,
+			manual_extra_rows: Math.max(
+				0,
+				Math.min(
+					stored.manual_extra_rows ?? 0,
+					RECOVERY_HARD_CEILING_ROWS - RECOVERY_SOFT_LIMIT_ROWS,
+				),
+			),
+		};
+	}
+
+	private async recoveryBudgetStatus() {
+		const stored =
+			(await this.ctx.storage.get<RecoveryBudgetState>(
+				RECOVERY_BUDGET_KEY,
+			)) ?? null;
+		const budget = this.normalizedRecoveryBudget(stored);
+		const effectiveLimit = Math.min(
+			budget.hard_ceiling_rows,
+			budget.soft_limit_rows + budget.manual_extra_rows,
+		);
+		return {
+			...budget,
+			effective_limit_rows: effectiveLimit,
+			remaining_estimated_rows: Math.max(
+				0,
+				effectiveLimit - budget.estimated_used_rows,
+			),
+			paused: budget.estimated_used_rows >= effectiveLimit,
+			note:
+				"Internal conservative recovery budget only. Live/current writes continue when recovery pauses.",
+		};
+	}
+
+	private isRecoveryWork(item: AutoQueueItem) {
+		return (
+			item.reason.includes("bootstrap") ||
+			item.reason.includes("backfill") ||
+			item.reason.includes("recovery")
+		);
+	}
+
+	private estimateRecoveryWriteCost(item: AutoQueueItem) {
+		return Math.max(
+			100,
+			Math.ceil(item.outputsize * RECOVERY_COST_MULTIPLIER + 100),
+		);
+	}
+
+	private async canRunRecoveryItem(item: AutoQueueItem) {
+		const budget = await this.recoveryBudgetStatus();
+		const estimatedCost = this.estimateRecoveryWriteCost(item);
+		return {
+			allowed:
+				budget.estimated_used_rows + estimatedCost <=
+				budget.effective_limit_rows,
+			estimated_cost_rows: estimatedCost,
+			budget,
+		};
+	}
+
+	private async consumeRecoveryBudget(
+		estimatedRows: number,
+		reason: string,
+	) {
+		const stored =
+			(await this.ctx.storage.get<RecoveryBudgetState>(
+				RECOVERY_BUDGET_KEY,
+			)) ?? null;
+		const budget = this.normalizedRecoveryBudget(stored);
+		budget.estimated_used_rows = Math.min(
+			budget.hard_ceiling_rows,
+			budget.estimated_used_rows + Math.max(0, estimatedRows),
+		);
+		budget.last_update_ms = Date.now();
+		budget.last_reason = reason;
+		await this.ctx.storage.put(RECOVERY_BUDGET_KEY, budget);
+		return this.recoveryBudgetStatus();
+	}
+
+	private async addRecoveryBudget(addRows: number) {
+		const stored =
+			(await this.ctx.storage.get<RecoveryBudgetState>(
+				RECOVERY_BUDGET_KEY,
+			)) ?? null;
+		const budget = this.normalizedRecoveryBudget(stored);
+		const requested = Math.max(
+			0,
+			Math.min(
+				Math.floor(addRows),
+				RECOVERY_MAX_MANUAL_ADD_ROWS,
+			),
+		);
+		const maximumExtra =
+			RECOVERY_HARD_CEILING_ROWS - RECOVERY_SOFT_LIMIT_ROWS;
+		budget.manual_extra_rows = Math.min(
+			maximumExtra,
+			budget.manual_extra_rows + requested,
+		);
+		budget.last_update_ms = Date.now();
+		budget.last_reason = `manual_override_plus_${requested}`;
+		await this.ctx.storage.put(RECOVERY_BUDGET_KEY, budget);
+		return this.recoveryBudgetStatus();
+	}
+
+	private enqueueBootstrapPlan() {
+		this.ensureAutoState();
+		for (const interval of REST_INTERVALS) {
+			this.enqueueAutoIntervals(
+				[interval],
+				BOOTSTRAP_OUTPUTSIZE_BY_INTERVAL[interval],
+				"bootstrap",
+			);
+		}
+		this.autoState!.bootstrap_pending = true;
+	}
+
+	private async retireThisInstance() {
+		this.enabled = false;
+		this.stopReconnectTimer();
+		this.closeSocket("retired durable object");
+		if (this.autoState) {
+			this.autoState.enabled = false;
+			this.autoState.queue = [];
+			this.autoState.bootstrap_pending = false;
+		}
+		try {
+			await this.ctx.storage.deleteAlarm();
+		} catch {}
+		return {
+			status: "retired",
+			build_version: BUILD_VERSION,
+			object_name: this.objectName(),
+			alarm_deleted: (await this.ctx.storage.getAlarm()) === null,
+		};
+	}
+
 	private createInitialAutoState(
 		nowCairo: string,
 		nowMs: number,
 	): AutoRefreshState {
 		return {
-			enabled: true,
+			enabled: false,
 			queue: [],
 			last_5m_key: scheduleBucketKey(nowCairo, 5),
 			last_15m_key: scheduleBucketKey(nowCairo, 15),
@@ -3796,10 +4151,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		try {
 			const watchdog = await this.ensureAutoWatchdog();
 			await this.ensureConnection();
-			await this.ensureStorageMigration();
 			this.ensureAutoState();
-			const autoWasEnabled = this.autoState!.enabled;
-			this.autoState!.enabled = true;
 
 			const beforeAudits: ContinuityAudit[] = [];
 			for (const interval of RECOVERY_INTERVALS) {
@@ -3828,6 +4180,23 @@ export class Chat extends DurableObject<LiveEnv> {
 			// Derived 3M is audited explicitly but repaired locally from 1M.
 			const threeMinuteBefore = await this.auditContinuity("3min");
 			beforeAudits.push(threeMinuteBefore);
+			if (
+				threeMinuteBefore.gap !== null ||
+				!threeMinuteBefore.effective_fresh
+			) {
+				const oneMinuteBefore =
+					beforeAudits.find((audit) => audit.interval === "1min") ??
+					await this.auditContinuity("1min");
+				this.enqueueAutoRepair(
+					"1min",
+					this.recoveryOutputsizeForStaleness(
+						"1min",
+						oneMinuteBefore.latest_confirmed_datetime,
+					),
+					threeMinuteBefore.gap?.after_datetime ?? null,
+					"gpt_recovery_3m_source_backfill",
+				);
+			}
 
 			// 4H is derived from confirmed 1H. If a closed 4H bucket is missing,
 			// force a targeted authoritative 1H refresh around that boundary.
@@ -3848,41 +4217,15 @@ export class Chat extends DurableObject<LiveEnv> {
 				);
 			}
 
-			const oneMinuteBefore = beforeAudits.find(
-				(audit) => audit.interval === "1min",
-			) ?? null;
-			const oneHourBefore = beforeAudits.find(
-				(audit) => audit.interval === "1h",
-			) ?? null;
-			const threeMinuteNeedsRebuild =
-				threeMinuteBefore.gap !== null ||
-				!threeMinuteBefore.effective_fresh ||
-				oneMinuteBefore?.gap !== null ||
-				oneMinuteBefore?.effective_fresh === false;
-			const fourHourNeedsRebuild =
-				fourHourBefore.gap !== null ||
-				!fourHourBefore.effective_fresh ||
-				oneHourBefore?.gap !== null ||
-				oneHourBefore?.effective_fresh === false;
-
 			const repairRequested = beforeAudits.some(
 				(audit) => audit.gap !== null || !audit.effective_fresh,
 			);
 
 			const queueHasWork = this.autoState!.queue.length > 0;
-			if (repairRequested || queueHasWork || !autoWasEnabled) {
+			if (repairRequested || queueHasWork) {
 				await this.persistAutoState();
 				await this.processAutoQueue();
 				await this.scheduleAutoAlarm();
-			}
-
-			// v14 read-first readiness: if no source/derived problem exists, do NOT
-			// rebuild 3M/4H merely because the GPT asked for readiness.
-			if (threeMinuteNeedsRebuild) {
-				await this.deriveThreeMinuteFromOneMinute();
-			}
-			if (fourHourNeedsRebuild) {
-				await this.deriveFourHourFromOneHour();
 			}
 
 			const afterAudits: ContinuityAudit[] = [];
@@ -4074,9 +4417,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		if (!state.enabled) return;
 
 		const now = Date.now();
-		if (
-			now - state.rate_window_start_ms >= AUTO_RATE_WINDOW_MS
-		) {
+		if (now - state.rate_window_start_ms >= AUTO_RATE_WINDOW_MS) {
 			state.rate_window_start_ms = now;
 			state.rate_requests = 0;
 		}
@@ -4085,9 +4426,44 @@ export class Chat extends DurableObject<LiveEnv> {
 			state.queue.length > 0 &&
 			state.rate_requests < AUTO_MAX_REQUESTS_PER_WINDOW
 		) {
-			const item = state.queue.shift()!;
+			let itemIndex = 0;
+			let item = state.queue[itemIndex];
+			let reservedRecoveryRows = 0;
+
+			if (this.isRecoveryWork(item)) {
+				const check = await this.canRunRecoveryItem(item);
+				if (!check.allowed) {
+					// Recovery pauses, but normal current-cadence refreshes are still
+					// allowed to run so live/current operation is never frozen by the
+					// 25K soft recovery budget.
+					const liveIndex = state.queue.findIndex(
+						(candidate) => !this.isRecoveryWork(candidate),
+					);
+					if (liveIndex < 0) {
+						state.last_error =
+							`RECOVERY_BUDGET_PAUSED: estimated ${check.estimated_cost_rows} rows would exceed internal limit ${check.budget.effective_limit_rows}.`;
+						break;
+					}
+					itemIndex = liveIndex;
+					item = state.queue[itemIndex];
+				} else {
+					reservedRecoveryRows = check.estimated_cost_rows;
+				}
+			}
+
+			state.queue.splice(itemIndex, 1);
 			state.rate_requests++;
 			await this.persistAutoState();
+
+			// Reserve the conservative estimate BEFORE any recovery writes happen.
+			// If the operation later fails, the reservation is intentionally not
+			// refunded; this biases the guard toward safety.
+			if (reservedRecoveryRows > 0) {
+				await this.consumeRecoveryBudget(
+					reservedRecoveryRows,
+					`${item.interval}:${item.reason}:reserved`,
+				);
+			}
 
 			const result = await this.syncHistoricalInterval(
 				item.interval,
@@ -4127,29 +4503,21 @@ export class Chat extends DurableObject<LiveEnv> {
 
 	async alarm() {
 		try {
+			if (this.isRetiredInstance()) {
+				await this.retireThisInstance();
+				return;
+			}
+
 			this.ensureAutoState();
 			const state = this.autoState!;
-			if (!state.enabled) return;
+			if (!state.enabled) {
+				try {
+					await this.ctx.storage.deleteAlarm();
+				} catch {}
+				return;
+			}
 
 			state.last_alarm_ms = Date.now();
-
-			try {
-				const migration = await this.ensureStorageMigration();
-				if (
-					migration &&
-					typeof migration === "object" &&
-					"status" in migration &&
-					(migration as { status?: unknown }).status === "error"
-				) {
-					state.last_error = String(
-						(migration as { error?: unknown }).error ??
-							"Storage migration check failed",
-					);
-				}
-			} catch (error) {
-				state.last_error =
-					error instanceof Error ? error.message : String(error);
-			}
 
 			const recoveryAuditDue =
 				state.last_recovery_audit_ms == null ||
@@ -5146,14 +5514,18 @@ export default {
 				status: "ok",
 				build_version: BUILD_VERSION,
 				service: "Gold Data Engine outer worker",
+				production_object_name: PROD_OBJECT_NAME,
+				legacy_object_name: LEGACY_OBJECT_NAME,
+				retired_object_names: RETIRED_OBJECT_NAMES,
+				recovery_soft_limit_rows: RECOVERY_SOFT_LIMIT_ROWS,
+				recovery_hard_ceiling_rows: RECOVERY_HARD_CEILING_ROWS,
 				durable_object_touched: false,
 			});
 		}
 
 		if (url.pathname === "/probe-fresh-do") {
 			try {
-				// Deliberately use a brand-new logical Durable Object ID. This does
-				// NOT replace production XAUUSD and does not touch its stored data.
+				// Dedicated zero-write probe object.
 				const probeId = env.Chat.idFromName(
 					"XAUUSD_V14_4_FRESH_PROBE_20260909",
 				);
@@ -5195,8 +5567,108 @@ export default {
 			}
 		}
 
+		if (url.pathname === "/retire-legacy") {
+			const results = [];
+			for (const objectName of RETIRED_OBJECT_NAMES) {
+				try {
+					const id = env.Chat.idFromName(objectName);
+					const stub = env.Chat.get(id);
+					const retireUrl = new URL(request.url);
+					retireUrl.pathname = "/retire-instance";
+					retireUrl.search = "";
+					const response = await stub.fetch(
+						new Request(retireUrl.toString(), {
+							method: "GET",
+							headers: request.headers,
+						}),
+					);
+					let body: unknown = null;
+					try {
+						body = await response.json();
+					} catch {
+						body = await response.text();
+					}
+					results.push({
+						object_name: objectName,
+						http_status: response.status,
+						result: body,
+					});
+				} catch (error) {
+					results.push({
+						object_name: objectName,
+						http_status: 503,
+						result: {
+							status: "error",
+							error:
+								error instanceof Error
+									? error.message
+									: String(error),
+						},
+					});
+				}
+			}
+			return json({
+				status: "ok",
+				build_version: BUILD_VERSION,
+				action: "retire_legacy",
+				production_object_name: PROD_OBJECT_NAME,
+				results,
+			});
+		}
+
+		if (url.pathname === "/probe-prod-do" || url.pathname === "/probe-legacy-do") {
+			try {
+				const objectName =
+					url.pathname === "/probe-prod-do"
+						? PROD_OBJECT_NAME
+						: LEGACY_OBJECT_NAME;
+				const probeId = env.Chat.idFromName(objectName);
+				const probeStub = env.Chat.get(probeId);
+				const probeUrl = new URL(request.url);
+				probeUrl.pathname = "/instance-probe";
+				probeUrl.search = "";
+				return await probeStub.fetch(
+					new Request(probeUrl.toString(), {
+						method: "GET",
+						headers: request.headers,
+					}),
+				);
+			} catch (error) {
+				const anyError = error as {
+					message?: unknown;
+					name?: unknown;
+					remote?: unknown;
+					retryable?: unknown;
+					overloaded?: unknown;
+				};
+				return json(
+					{
+						status: "error",
+						build_version: BUILD_VERSION,
+						probe:
+							url.pathname === "/probe-prod-do"
+								? "production_durable_object"
+								: "legacy_durable_object",
+						error:
+							anyError?.message != null
+								? String(anyError.message)
+								: String(error),
+						name:
+							anyError?.name != null ? String(anyError.name) : null,
+						remote: Boolean(anyError?.remote),
+						retryable: Boolean(anyError?.retryable),
+						overloaded: Boolean(anyError?.overloaded),
+					},
+					503,
+				);
+			}
+		}
+
 		try {
-			const id = env.Chat.idFromName("XAUUSD");
+			// Production traffic is intentionally moved to a fresh logical Durable
+			// Object instance. The legacy XAUUSD instance remains untouched so its
+			// stored data can be preserved for later inspection/recovery.
+			const id = env.Chat.idFromName(PROD_OBJECT_NAME);
 			const stub = env.Chat.get(id);
 			return await stub.fetch(request);
 		} catch (error) {
