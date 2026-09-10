@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v15.1-micro-gap-tolerance-derived-integrity-40k-2026-09-10";
+const BUILD_VERSION = "v15.2-synthetic-micro-gap-bridge-40k-2026-09-10";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -44,6 +44,7 @@ const RECOVERY_BUFFER_ROWS = 40;
 const RECOVERY_MAX_OUTPUTSIZE = 1150;
 const RECOVERY_NOOP_COOLDOWN_MS = 30 * 60_000;
 const RECOVERY_TARGET_OVERLAP_BUCKETS = 3;
+const SYNTHETIC_MICRO_GAP_MAX_1M = 2;
 const CONTINUITY_SCAN_CONFIRMED_LIMIT = 1000;
 const AUTO_RECOVERY_AUDIT_INTERVAL_MS = 5 * 60_000;
 const RECOVERY_INTERVALS = [
@@ -3014,18 +3015,6 @@ export class Chat extends DurableObject<LiveEnv> {
 				};
 			}
 
-			const legacySyntheticRows = source.filter(
-				(c) => c.synthetic_gap === true,
-			);
-
-			if (legacySyntheticRows.length > 0) {
-				return {
-					status: "error",
-					interval: "3min",
-					error:
-						"Legacy standalone synthetic-gap rows detected in normalized 1min. Run /normalize?interval=1min first, or use /normalize?interval=all.",
-				};
-			}
 
 			const sourceMeta =
 				(await this.ctx.storage.get<NormalizedMeta>(
@@ -3035,6 +3024,9 @@ export class Chat extends DurableObject<LiveEnv> {
 			const regularRows = source;
 			const sourceGapAdjustedRows = source.filter(
 				(c) => c.gap_adjusted === true,
+			).length;
+			const sourceSyntheticGapRows = source.filter(
+				(c) => c.synthetic_gap === true,
 			).length;
 
 			const buckets = new Map<string, NormalizedCandle[]>();
@@ -3087,6 +3079,9 @@ export class Chat extends DurableObject<LiveEnv> {
 				const gapAdjusted = rows.some(
 					(c) => c.gap_adjusted === true,
 				);
+				const containsSynthetic = rows.some(
+					(c) => c.synthetic_gap === true,
+				);
 
 				if (gapAdjusted) {
 					gapContainingBuckets++;
@@ -3105,10 +3100,12 @@ export class Chat extends DurableObject<LiveEnv> {
 						statusFromExpectedClose(
 							expectedCloseTime,
 						),
-					source: "derived_1min",
+					source: containsSynthetic
+						? "derived_1min_with_synthetic_bridge"
+						: "derived_1min",
 					provisional: false,
 					confirmed: true,
-					synthetic_gap: false,
+					synthetic_gap: containsSynthetic,
 					gap_adjusted: gapAdjusted,
 					stored_at_ms: Date.now(),
 				});
@@ -3156,7 +3153,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				source_rows_seen: source.length,
 				source_regular_rows: regularRows.length,
 				source_gap_adjusted_rows: sourceGapAdjustedRows,
-				source_synthetic_gap_rows: 0,
+				source_synthetic_gap_rows: sourceSyntheticGapRows,
 				complete_3min_buckets: completeBuckets,
 				incomplete_3min_buckets: incompleteBuckets,
 				gap_containing_3min_buckets: gapContainingBuckets,
@@ -3182,7 +3179,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				source_rows_seen: source.length,
 				source_regular_rows: regularRows.length,
 				source_gap_adjusted_rows: sourceGapAdjustedRows,
-				source_synthetic_gap_rows: 0,
+				source_synthetic_gap_rows: sourceSyntheticGapRows,
 				complete_3min_buckets: completeBuckets,
 				incomplete_3min_buckets: incompleteBuckets,
 				gap_containing_3min_buckets: gapContainingBuckets,
@@ -3197,7 +3194,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				latest_datetime: meta.latest_datetime,
 				analysis_performed: false,
 				note:
-					"3min is deterministic OHLC aggregation from normalized 1min. Reopening gaps are already contained inside the first real 1min candle, so no standalone gap row is created or carried into 3min. No market-analysis logic is performed.",
+					"3min is deterministic OHLC aggregation from normalized 1min. Isolated 1M omissions of up to two candles may be bridged by explicitly tagged synthetic approximations and are then aggregated normally. No market-analysis logic is performed here.",
 			};
 		} catch (error) {
 			return {
@@ -4181,6 +4178,110 @@ export class Chat extends DurableObject<LiveEnv> {
 		};
 	}
 
+
+	private async synthesizeSmallOneMinuteGaps() {
+		// v15.2 policy: after real REST/live recovery has had a chance to fill the
+		// data, bridge only isolated 1M holes of one or two consecutive candles.
+		// The approximation is deterministic and explicit:
+		// - first synthetic Open = previous real/effective Close
+		// - last synthetic Close = next real/effective Open
+		// - multiple missing candles linearly bridge between those endpoints
+		// - High/Low are exactly the body extrema (no invented wicks)
+		// These rows are analysis-eligible CLOSED candles, but remain permanently
+		// tagged synthetic_gap=true and source=synthetic_bridge_approximation.
+		const rows = await this.effectiveRowsForContinuity("1min");
+		if (rows.length < 2) {
+			return { created: 0, candles: [] as string[] };
+		}
+
+		const candidates: NormalizedCandle[] = [];
+		for (let i = 0; i < rows.length - 1; i++) {
+			const before = rows[i];
+			const after = rows[i + 1];
+			const missing = this.countMissingMarketBuckets(
+				before.datetime,
+				after.datetime,
+				"1min",
+			);
+			if (
+				missing.count < 1 ||
+				missing.count > SYNTHETIC_MICRO_GAP_MAX_1M ||
+				!missing.first ||
+				!missing.last
+			) {
+				continue;
+			}
+
+			// Never bridge a declared market closure/session gap.
+			if (hasDeclaredClosureBetween(before.datetime, after.datetime)) {
+				continue;
+			}
+
+			const start = Number(before.close);
+			const end = Number(after.open);
+			if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+
+			const step = (end - start) / missing.count;
+			for (let n = 0; n < missing.count; n++) {
+				const datetime = addMinutesToCairoDatetime(before.datetime, n + 1);
+				const open = start + step * n;
+				const close = start + step * (n + 1);
+				const expectedClose = addMinutesToCairoDatetime(datetime, 1);
+				candidates.push({
+					timeframe: "1min",
+					datetime,
+					open_time: datetime,
+					expected_close_time: expectedClose,
+					open,
+					high: Math.max(open, close),
+					low: Math.min(open, close),
+					close,
+					status: "CLOSED",
+					source: "synthetic_bridge_approximation",
+					provisional: false,
+					confirmed: true,
+					synthetic_gap: true,
+					gap_adjusted: false,
+					stored_at_ms: Date.now(),
+				});
+			}
+		}
+
+		if (candidates.length === 0) {
+			return { created: 0, candles: [] as string[] };
+		}
+
+		const stats = await this.upsertNormalizedCandidates(candidates);
+		return {
+			created: stats.written,
+			unchanged: stats.unchanged,
+			candles: candidates.map((c) => c.datetime),
+			method:
+				"open=previous close; close=next open (linear bridge for 2 candles); high/low=body extrema; no invented wicks",
+		};
+	}
+
+	private async syntheticApproximationReport() {
+		const page = await this.ctx.storage.list<NormalizedCandle>({
+			prefix: normalizedPrefix("1min"),
+			reverse: true,
+			limit: CONTINUITY_SCAN_CONFIRMED_LIMIT,
+		});
+		const synthetic = Array.from(page.values())
+			.filter(
+				(candle) =>
+					candle.synthetic_gap === true &&
+					candle.source === "synthetic_bridge_approximation",
+			)
+			.sort((a, b) => a.datetime.localeCompare(b.datetime));
+		return {
+			count: synthetic.length,
+			candles: synthetic.map((c) => c.datetime),
+			note:
+				"Informational only. These isolated 1M candles were approximated automatically and remain fully analysis-eligible. Do not repeatedly downgrade or restate this warning in market analysis.",
+		};
+	}
+
 	private recoveryTargetEndDate(
 		sourceInterval: RecoveryInterval,
 		gap: ContinuityGap,
@@ -4446,6 +4547,14 @@ export class Chat extends DurableObject<LiveEnv> {
 				await this.scheduleAutoAlarm();
 			}
 
+			// v15.2: real recovery gets first priority. If one or two isolated 1M
+			// candles are still absent, create deterministic bridge candles and rebuild
+			// 3M so analysis can proceed normally.
+			const syntheticBridge = await this.synthesizeSmallOneMinuteGaps();
+			if (syntheticBridge.created > 0) {
+				await this.deriveRecentThreeMinuteFromOneMinute();
+			}
+
 			const afterAudits: ContinuityAudit[] = [];
 			for (const interval of [
 				"1min",
@@ -4463,11 +4572,9 @@ export class Chat extends DurableObject<LiveEnv> {
 				(audit) => audit.gap !== null || !audit.effective_fresh,
 			);
 
-			// v15.1: a single isolated 1M provider/tick omission must not freeze the
-			// entire multi-timeframe analysis when every parent/confirmation frame is
-			// continuous and fresh. We never synthesize the missing OHLC. Instead the
-			// affected 1M bucket, and its containing 3M bucket, are explicitly
-			// restricted from candle-derived conclusions while 5M+ remain usable.
+			// Fallback only: v15.2 normally bridges one/two isolated 1M omissions. If a
+			// bridge cannot be formed yet (for example no next real candle exists), keep
+			// the older restricted-window safety mode rather than inventing an endpoint.
 			const oneMinuteAfter = afterAudits.find((audit) => audit.interval === "1min") ?? null;
 			const threeMinuteAfter = afterAudits.find((audit) => audit.interval === "3min") ?? null;
 			const higherAfter = afterAudits.filter((audit) =>
@@ -4498,6 +4605,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				onlyMicroProblems,
 			);
 
+			const approximationReport = await this.syntheticApproximationReport();
+
 			const marketClosed = isClosedMarketCairoDatetime(cairoTime(Date.now()));
 			const analysisReady = marketClosed
 				? remainingProblems.every((audit) => audit.gap === null)
@@ -4523,6 +4632,7 @@ export class Chat extends DurableObject<LiveEnv> {
 						? "queued_or_rate_limited"
 						: "partial",
 				analysis_ready: analysisReady,
+				synthetic_approximation_report: approximationReport,
 				readiness_mode: isolatedMicroGapAllowed
 					? "isolated_micro_gap_non_blocking"
 					: analysisReady
@@ -4666,6 +4776,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			}
 
 			if (item.interval === "1min") {
+				await this.synthesizeSmallOneMinuteGaps();
 				if (bootstrap) {
 					await this.deriveThreeMinuteFromOneMinute();
 				} else {
@@ -5067,6 +5178,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			const expectedClose = addMinutesToCairoDatetime(bucketStart, 3);
 			if (statusFromExpectedClose(expectedClose) === "OPEN") continue;
 
+			const containsSynthetic = rows.some((c) => c.synthetic_gap === true);
 			candidates.push({
 				timeframe: "3min",
 				datetime: bucketStart,
@@ -5077,10 +5189,12 @@ export class Chat extends DurableObject<LiveEnv> {
 				low: Math.min(...rows.map((c) => c.low)),
 				close: rows[2].close,
 				status: "CLOSED",
-				source: "derived_1min",
+				source: containsSynthetic
+					? "derived_1min_with_synthetic_bridge"
+					: "derived_1min",
 				provisional: false,
 				confirmed: true,
-				synthetic_gap: false,
+				synthetic_gap: containsSynthetic,
 				gap_adjusted: rows.some((c) => c.gap_adjusted),
 				stored_at_ms: Date.now(),
 			});
