@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v15.2-synthetic-micro-gap-bridge-40k-2026-09-10";
+const BUILD_VERSION = "v15.3-synthetic-micro-gap-bridge-5m-40k-2026-09-10";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -44,7 +44,7 @@ const RECOVERY_BUFFER_ROWS = 40;
 const RECOVERY_MAX_OUTPUTSIZE = 1150;
 const RECOVERY_NOOP_COOLDOWN_MS = 30 * 60_000;
 const RECOVERY_TARGET_OVERLAP_BUCKETS = 3;
-const SYNTHETIC_MICRO_GAP_MAX_1M = 2;
+const SYNTHETIC_MICRO_GAP_MAX_1M = 5;
 const CONTINUITY_SCAN_CONFIRMED_LIMIT = 1000;
 const AUTO_RECOVERY_AUDIT_INTERVAL_MS = 5 * 60_000;
 const RECOVERY_INTERVALS = [
@@ -3194,7 +3194,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				latest_datetime: meta.latest_datetime,
 				analysis_performed: false,
 				note:
-					"3min is deterministic OHLC aggregation from normalized 1min. Isolated 1M omissions of up to two candles may be bridged by explicitly tagged synthetic approximations and are then aggregated normally. No market-analysis logic is performed here.",
+					"3min is deterministic OHLC aggregation from normalized 1min. Isolated 1M omissions of up to five candles may be bridged by explicitly tagged synthetic approximations and are then aggregated normally. No market-analysis logic is performed here.",
 			};
 		} catch (error) {
 			return {
@@ -4180,8 +4180,8 @@ export class Chat extends DurableObject<LiveEnv> {
 
 
 	private async synthesizeSmallOneMinuteGaps() {
-		// v15.2 policy: after real REST/live recovery has had a chance to fill the
-		// data, bridge only isolated 1M holes of one or two consecutive candles.
+		// v15.3 policy: after real REST/live recovery has had a chance to fill the
+		// data, bridge only isolated 1M holes of up to five consecutive candles.
 		// The approximation is deterministic and explicit:
 		// - first synthetic Open = previous real/effective Close
 		// - last synthetic Close = next real/effective Open
