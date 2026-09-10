@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v14.7-error-health-idle-write-optimization-2026-09-09";
+const BUILD_VERSION = "v14.9-targeted-gap-recovery-40k-2026-09-10";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -13,7 +13,7 @@ const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
 // estimated candle. Normal live/current storage is NOT paused by this budget;
 // only bootstrap/backfill/recovery work is paused.
 const RECOVERY_BUDGET_KEY = "recovery_write_budget_v1";
-const RECOVERY_SOFT_LIMIT_ROWS = 25_000;
+const RECOVERY_SOFT_LIMIT_ROWS = 40_000;
 const RECOVERY_HARD_CEILING_ROWS = 60_000;
 const RECOVERY_MAX_MANUAL_ADD_ROWS = 25_000;
 const RECOVERY_COST_MULTIPLIER = 3;
@@ -42,6 +42,8 @@ const AUTO_BOOTSTRAP_OUTPUTSIZE = 1150;
 const AUTO_WATCHDOG_STALE_MS = 12 * 60_000;
 const RECOVERY_BUFFER_ROWS = 40;
 const RECOVERY_MAX_OUTPUTSIZE = 1150;
+const RECOVERY_NOOP_COOLDOWN_MS = 30 * 60_000;
+const RECOVERY_TARGET_OVERLAP_BUCKETS = 3;
 const CONTINUITY_SCAN_CONFIRMED_LIMIT = 1000;
 const AUTO_RECOVERY_AUDIT_INTERVAL_MS = 5 * 60_000;
 const RECOVERY_INTERVALS = [
@@ -315,6 +317,10 @@ type AutoRefreshState = {
 	last_error: string | null;
 	bootstrap_pending: boolean;
 	last_recovery_audit_ms?: number | null;
+	// v14.9: no-op recovery cooldowns are piggybacked on existing auto-state writes.
+	// This prevents an unrecoverable provider omission from draining the internal
+	// recovery reservation every five minutes. Key = interval|targeted end_date.
+	recovery_noop_until_ms?: Record<string, number>;
 };
 
 type RecoveryBudgetState = {
@@ -3911,6 +3917,9 @@ export class Chat extends DurableObject<LiveEnv> {
 			recovery_pending: state.queue.some((item) =>
 				item.reason.includes("recovery") || item.reason.includes("backfill"),
 			),
+			recovery_noop_cooldowns_active: Object.values(
+				state.recovery_noop_until_ms ?? {},
+			).filter((until) => until > Date.now()).length,
 			rate_requests_this_window: state.rate_requests,
 			last_alarm_time:
 				state.last_alarm_ms !== null
@@ -4172,6 +4181,38 @@ export class Chat extends DurableObject<LiveEnv> {
 		};
 	}
 
+	private recoveryTargetEndDate(
+		sourceInterval: RecoveryInterval,
+		gap: ContinuityGap,
+	) {
+		// Twelve Data end_date behavior can be inclusive/exclusive around a
+		// missing bucket. Move the cursor a few SOURCE buckets past the first
+		// known candle after the gap so the returned page overlaps both sides.
+		const overlapMinutes =
+			this.continuityIntervalMinutes(sourceInterval) *
+			RECOVERY_TARGET_OVERLAP_BUCKETS;
+		return addMinutesToCairoDatetime(gap.after_datetime, overlapMinutes);
+	}
+
+	private recoveryNoopKey(
+		interval: RecoveryInterval,
+		before: string | null,
+	) {
+		return `${interval}|${before ?? "latest"}`;
+	}
+
+	private isRecoveryNoopCoolingDown(
+		interval: RecoveryInterval,
+		before: string | null,
+	) {
+		this.ensureAutoState();
+		const until =
+			this.autoState!.recovery_noop_until_ms?.[
+				this.recoveryNoopKey(interval, before)
+			] ?? 0;
+		return until > Date.now();
+	}
+
 	private recoveryOutputsizeForGap(
 		interval: RecoveryInterval,
 		gap: ContinuityGap,
@@ -4211,13 +4252,26 @@ export class Chat extends DurableObject<LiveEnv> {
 	) {
 		this.ensureAutoState();
 		const state = this.autoState!;
+		if (
+			this.isRecoveryWork({
+				interval,
+				outputsize,
+				before,
+				reason,
+				enqueued_ms: Date.now(),
+				attempts: 0,
+			}) &&
+			this.isRecoveryNoopCoolingDown(interval, before)
+		) {
+			return false;
+		}
 		const existing = state.queue.find(
 			(item) => item.interval === interval && (item.before ?? null) === before,
 		);
 		if (existing) {
 			existing.outputsize = Math.max(existing.outputsize, outputsize);
 			if (!existing.reason.includes(reason)) existing.reason += `|${reason}`;
-			return;
+			return true;
 		}
 		state.queue.push({
 			interval,
@@ -4227,6 +4281,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			attempts: 0,
 			before,
 		});
+		return true;
 	}
 
 	private async enqueueStaleRecovery(nowMs: number) {
@@ -4239,7 +4294,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				this.enqueueAutoRepair(
 					interval,
 					this.recoveryOutputsizeForGap(interval, audit.gap),
-					audit.gap.after_datetime,
+					this.recoveryTargetEndDate(interval, audit.gap),
 					"auto_recovery_backfill",
 				);
 				continue;
@@ -4262,18 +4317,26 @@ export class Chat extends DurableObject<LiveEnv> {
 		// provisional. In that case force a targeted 1H REST refresh ending at
 		// the next existing 4H bucket, then the normal post-refresh derivation
 		// rebuilds 4H from authoritative 1H history.
-		const fourHourAudit = await this.auditContinuity("4h");
+		let fourHourAudit = await this.auditContinuity("4h");
 		if (fourHourAudit.gap) {
 			const oneHourAudit = await this.auditContinuity("1h");
-			this.enqueueAutoRepair(
-				"1h",
-				this.recoveryOutputsizeForStaleness(
+			// First rebuild the derived 4H layer from already-authoritative 1H.
+			// Only spend a REST recovery request if the source itself cannot fix it.
+			if (oneHourAudit.gap === null && oneHourAudit.effective_fresh) {
+				await this.deriveFourHourFromOneHour();
+				fourHourAudit = await this.auditContinuity("4h");
+			}
+			if (fourHourAudit.gap) {
+				this.enqueueAutoRepair(
 					"1h",
-					oneHourAudit.latest_confirmed_datetime,
-				),
-				fourHourAudit.gap.after_datetime,
-				"auto_recovery_4h_source_backfill",
-			);
+					this.recoveryOutputsizeForStaleness(
+						"1h",
+						oneHourAudit.latest_confirmed_datetime,
+					),
+					this.recoveryTargetEndDate("1h", fourHourAudit.gap),
+					"auto_recovery_4h_source_backfill",
+				);
+			}
 		}
 	}
 
@@ -4292,7 +4355,7 @@ export class Chat extends DurableObject<LiveEnv> {
 					this.enqueueAutoRepair(
 						interval,
 						this.recoveryOutputsizeForGap(interval, audit.gap),
-						audit.gap.after_datetime,
+						this.recoveryTargetEndDate(interval, audit.gap),
 						"gpt_recovery_backfill",
 					);
 				} else if (!audit.effective_fresh) {
@@ -4308,8 +4371,10 @@ export class Chat extends DurableObject<LiveEnv> {
 				}
 			}
 
-			// Derived 3M is audited explicitly but repaired locally from 1M.
-			const threeMinuteBefore = await this.auditContinuity("3min");
+			// 3M is derived from 1M. Never double-charge recovery when 1M already
+			// has the blocking source gap. If 1M is healthy, rebuild 3M locally
+			// first; only use REST if a source-side problem remains.
+			let threeMinuteBefore = await this.auditContinuity("3min");
 			beforeAudits.push(threeMinuteBefore);
 			if (
 				threeMinuteBefore.gap !== null ||
@@ -4318,34 +4383,56 @@ export class Chat extends DurableObject<LiveEnv> {
 				const oneMinuteBefore =
 					beforeAudits.find((audit) => audit.interval === "1min") ??
 					await this.auditContinuity("1min");
-				this.enqueueAutoRepair(
-					"1min",
-					this.recoveryOutputsizeForStaleness(
+
+				if (oneMinuteBefore.gap === null && oneMinuteBefore.effective_fresh) {
+					await this.deriveThreeMinuteFromOneMinute();
+					threeMinuteBefore = await this.auditContinuity("3min");
+				}
+
+				if (
+					(threeMinuteBefore.gap !== null ||
+						!threeMinuteBefore.effective_fresh) &&
+					oneMinuteBefore.gap === null
+				) {
+					this.enqueueAutoRepair(
 						"1min",
-						oneMinuteBefore.latest_confirmed_datetime,
-					),
-					threeMinuteBefore.gap?.after_datetime ?? null,
-					"gpt_recovery_3m_source_backfill",
-				);
+						this.recoveryOutputsizeForStaleness(
+							"1min",
+							oneMinuteBefore.latest_confirmed_datetime,
+						),
+						threeMinuteBefore.gap
+							? this.recoveryTargetEndDate("1min", threeMinuteBefore.gap)
+							: null,
+						"gpt_recovery_3m_source_backfill",
+					);
+				}
 			}
 
 			// 4H is derived from confirmed 1H. If a closed 4H bucket is missing,
 			// force a targeted authoritative 1H refresh around that boundary.
-			const fourHourBefore = await this.auditContinuity("4h");
+			let fourHourBefore = await this.auditContinuity("4h");
 			beforeAudits.push(fourHourBefore);
 			if (fourHourBefore.gap) {
 				const oneHourBefore =
 					beforeAudits.find((audit) => audit.interval === "1h") ??
 					await this.auditContinuity("1h");
-				this.enqueueAutoRepair(
-					"1h",
-					this.recoveryOutputsizeForStaleness(
+
+				if (oneHourBefore.gap === null && oneHourBefore.effective_fresh) {
+					await this.deriveFourHourFromOneHour();
+					fourHourBefore = await this.auditContinuity("4h");
+				}
+
+				if (fourHourBefore.gap) {
+					this.enqueueAutoRepair(
 						"1h",
-						oneHourBefore.latest_confirmed_datetime,
-					),
-					fourHourBefore.gap.after_datetime,
-					"gpt_recovery_4h_source_backfill",
-				);
+						this.recoveryOutputsizeForStaleness(
+							"1h",
+							oneHourBefore.latest_confirmed_datetime,
+						),
+						this.recoveryTargetEndDate("1h", fourHourBefore.gap),
+						"gpt_recovery_4h_source_backfill",
+					);
+				}
 			}
 
 			const repairRequested = beforeAudits.some(
@@ -4566,7 +4653,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				if (!check.allowed) {
 					// Recovery pauses, but normal current-cadence refreshes are still
 					// allowed to run so live/current operation is never frozen by the
-					// 25K soft recovery budget.
+					// 40K soft recovery budget.
 					const liveIndex = state.queue.findIndex(
 						(candidate) => !this.isRecoveryWork(candidate),
 					);
@@ -4612,6 +4699,23 @@ export class Chat extends DurableObject<LiveEnv> {
 					await this.postAutoRefresh(item);
 					state.last_success_ms = Date.now();
 					state.last_error = null;
+
+					if (this.isRecoveryWork(item)) {
+						state.recovery_noop_until_ms ??= {};
+						const key = this.recoveryNoopKey(
+							item.interval as RecoveryInterval,
+							item.before ?? null,
+						);
+						const rowsWritten = Number(
+							(result as { rows_written?: number }).rows_written ?? 0,
+						);
+						if (rowsWritten === 0) {
+							state.recovery_noop_until_ms[key] =
+								Date.now() + RECOVERY_NOOP_COOLDOWN_MS;
+						} else {
+							delete state.recovery_noop_until_ms[key];
+						}
+					}
 				} catch (error) {
 					state.last_error =
 						error instanceof Error
