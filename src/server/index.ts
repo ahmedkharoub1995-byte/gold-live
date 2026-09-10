@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v14.9-targeted-gap-recovery-40k-2026-09-10";
+const BUILD_VERSION = "v15.0-effective-live-gap-fallback-40k-2026-09-10";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -4629,6 +4629,31 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 	}
 
+	private async recoveryGapStillPresentForItem(item: AutoQueueItem) {
+		if (!this.isRecoveryWork(item)) return false;
+
+		let auditInterval: AnalysisNormalizedInterval = item.interval;
+		if (item.reason.includes("3m_source_backfill")) auditInterval = "3min";
+		if (item.reason.includes("4h_source_backfill")) auditInterval = "4h";
+
+		const audit = await this.auditContinuity(auditInterval);
+		if (!audit.gap) return false;
+
+		// If the same targeted cursor would be generated again, this recovery did
+		// not resolve the blocking omission. Cool it down even when the REST page
+		// happened to contain other changed rows. This prevents budget churn.
+		const sourceInterval: RecoveryInterval =
+			item.interval === "1h" ? "1h" :
+			item.interval === "30min" ? "30min" :
+			item.interval === "15min" ? "15min" :
+			item.interval === "5min" ? "5min" : "1min";
+		const expectedCursor = this.recoveryTargetEndDate(
+			sourceInterval,
+			audit.gap,
+		);
+		return (item.before ?? null) === expectedCursor;
+	}
+
 	private async processAutoQueue() {
 		this.ensureAutoState();
 		const state = this.autoState!;
@@ -4709,7 +4734,9 @@ export class Chat extends DurableObject<LiveEnv> {
 						const rowsWritten = Number(
 							(result as { rows_written?: number }).rows_written ?? 0,
 						);
-						if (rowsWritten === 0) {
+						const sameGapStillPresent =
+							await this.recoveryGapStillPresentForItem(item);
+						if (rowsWritten === 0 || sameGapStillPresent) {
 							state.recovery_noop_until_ms[key] =
 								Date.now() + RECOVERY_NOOP_COOLDOWN_MS;
 						} else {
@@ -5631,31 +5658,32 @@ export class Chat extends DurableObject<LiveEnv> {
 			return current ? [current] : [];
 		}
 
-		const latestPage =
-			await this.ctx.storage.list<NormalizedCandle>({
-				prefix: normalizedPrefix(interval),
-				reverse: true,
-				limit: 1,
-			});
-		const latest = Array.from(latestPage.values())[0] ?? null;
 		const nowCairo = cairoTime(Date.now());
 		if (isClosedMarketCairoDatetime(nowCairo)) return [];
 
+		// v15.0 IMPORTANT:
+		// Do not start the Effective overlay only AFTER the latest REST-confirmed
+		// candle. Twelve Data can omit an isolated closed 1M candle while later
+		// REST candles continue normally. In that case the tick-built candle may
+		// still exist in live_state, but the old logic hid it because it was older
+		// than latest confirmed. Overlay the whole retained live window instead.
+		// Confirmed REST is merged afterwards by callers and remains authoritative
+		// on every overlapping timestamp. No candle is fabricated.
+		const retainedLiveStart =
+			this.candles.length > 0
+				? this.candles[0].datetime
+				: this.currentCandle?.datetime ??
+					cairoTime(Date.now() - 8 * 60 * 60 * 1000);
+
 		if (interval === "1min") {
-			const start = latest?.expected_close_time ??
-				cairoTime(Date.now() - 8 * 60 * 60 * 1000);
-			const rows = await this.getEffectiveOneMinuteRows(start, nowCairo);
-			return rows.filter((c) => !latest || c.datetime > latest.datetime);
+			return this.getEffectiveOneMinuteRows(retainedLiveStart, nowCairo);
 		}
 
-		const start = latest?.expected_close_time ??
-			cairoTime(Date.now() - 8 * 60 * 60 * 1000);
-		const rows = await this.deriveEffectiveIntradayFromOneMinute(
+		return this.deriveEffectiveIntradayFromOneMinute(
 			interval,
-			start,
+			retainedLiveStart,
 			nowCairo,
 		);
-		return rows.filter((c) => !latest || c.datetime > latest.datetime);
 	}
 
 	private getState() {
