@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v15.0-effective-live-gap-fallback-40k-2026-09-10";
+const BUILD_VERSION = "v15.1-micro-gap-tolerance-derived-integrity-40k-2026-09-10";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -4462,10 +4462,51 @@ export class Chat extends DurableObject<LiveEnv> {
 			const remainingProblems = afterAudits.filter(
 				(audit) => audit.gap !== null || !audit.effective_fresh,
 			);
-			const analysisReady =
-				isClosedMarketCairoDatetime(cairoTime(Date.now()))
-					? remainingProblems.every((audit) => audit.gap === null)
-					: remainingProblems.length === 0;
+
+			// v15.1: a single isolated 1M provider/tick omission must not freeze the
+			// entire multi-timeframe analysis when every parent/confirmation frame is
+			// continuous and fresh. We never synthesize the missing OHLC. Instead the
+			// affected 1M bucket, and its containing 3M bucket, are explicitly
+			// restricted from candle-derived conclusions while 5M+ remain usable.
+			const oneMinuteAfter = afterAudits.find((audit) => audit.interval === "1min") ?? null;
+			const threeMinuteAfter = afterAudits.find((audit) => audit.interval === "3min") ?? null;
+			const higherAfter = afterAudits.filter((audit) =>
+				["5min", "15min", "30min", "1h", "4h"].includes(audit.interval),
+			);
+			const isolatedOneMinuteGap =
+				oneMinuteAfter?.gap !== null &&
+				oneMinuteAfter?.gap !== undefined &&
+				oneMinuteAfter.gap.missing_buckets === 1 &&
+				oneMinuteAfter.gap.missing_market_minutes === 1 &&
+				oneMinuteAfter.effective_fresh === true;
+			const threeMinuteCompatible =
+				threeMinuteAfter !== null &&
+				threeMinuteAfter.effective_fresh === true &&
+				(threeMinuteAfter.gap === null ||
+					(threeMinuteAfter.gap.missing_buckets === 1 &&
+					 threeMinuteAfter.gap.missing_market_minutes === 3));
+			const higherFramesHealthy = higherAfter.every(
+				(audit) => audit.gap === null && audit.effective_fresh,
+			);
+			const onlyMicroProblems = remainingProblems.every((audit) =>
+				audit.interval === "1min" || audit.interval === "3min",
+			);
+			const isolatedMicroGapAllowed = Boolean(
+				isolatedOneMinuteGap &&
+				threeMinuteCompatible &&
+				higherFramesHealthy &&
+				onlyMicroProblems,
+			);
+
+			const marketClosed = isClosedMarketCairoDatetime(cairoTime(Date.now()));
+			const analysisReady = marketClosed
+				? remainingProblems.every((audit) => audit.gap === null)
+				: remainingProblems.length === 0 || isolatedMicroGapAllowed;
+
+			const restrictedGap = isolatedMicroGapAllowed ? oneMinuteAfter!.gap : null;
+			const restrictedThreeMinuteBucket = restrictedGap
+				? threeMinuteBucketStart(restrictedGap.missing_from)
+				: null;
 
 			return {
 				status: "ok",
@@ -4475,11 +4516,29 @@ export class Chat extends DurableObject<LiveEnv> {
 				watchdog,
 				repair_requested: repairRequested,
 				repair_status: analysisReady
-					? "ready"
+					? isolatedMicroGapAllowed
+						? "ready_with_isolated_micro_gap"
+						: "ready"
 					: this.autoState!.queue.length > 0
 						? "queued_or_rate_limited"
 						: "partial",
 				analysis_ready: analysisReady,
+				readiness_mode: isolatedMicroGapAllowed
+					? "isolated_micro_gap_non_blocking"
+					: analysisReady
+						? "full"
+						: "degraded",
+				restricted_timeframes: isolatedMicroGapAllowed ? ["1min", "3min"] : [],
+				restricted_window: isolatedMicroGapAllowed && restrictedGap
+					? {
+						one_minute_missing_from: restrictedGap.missing_from,
+						one_minute_missing_to: restrictedGap.missing_to,
+						three_minute_bucket: restrictedThreeMinuteBucket,
+					}
+					: null,
+				execution_policy: isolatedMicroGapAllowed
+					? "Do not confirm or invalidate 1M/3M MSS, BOS, FVG, UC/OB, sweep, PH/PL, or other candle-derived events whose evidence crosses the restricted window. Use 5M as the smallest fully trusted execution timeframe until the window ages out. No OHLC is synthesized."
+					: "normal",
 				before: beforeAudits,
 				after: afterAudits,
 				auto: this.publicAutoState(),
@@ -4964,8 +5023,10 @@ export class Chat extends DurableObject<LiveEnv> {
 
 
 	private async deriveRecentThreeMinuteFromOneMinute() {
-		// Only a small tail is needed during routine 1M refreshes. Recovery uses
-		// the full diff-based derivation instead.
+		// v15.1: recent derivation is a reconciliation, not append-only. If a
+		// previously stored 3M candle loses one of its three authoritative 1M
+		// source rows, that stale 3M row must be removed instead of surviving and
+		// falsely making continuity look complete.
 		const page = await this.ctx.storage.list<NormalizedCandle>({
 			prefix: normalizedPrefix("1min"),
 			reverse: true,
@@ -4986,6 +5047,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 
 		const candidates: NormalizedCandle[] = [];
+		const bucketStarts = Array.from(buckets.keys()).sort();
 		for (const [bucketStart, rowsInput] of buckets) {
 			const rows = rowsInput.slice().sort((a, b) =>
 				a.datetime.localeCompare(b.datetime),
@@ -5024,7 +5086,16 @@ export class Chat extends DurableObject<LiveEnv> {
 			});
 		}
 
-		return await this.upsertNormalizedCandidates(candidates);
+		if (bucketStarts.length === 0) {
+			return { written: 0, unchanged: 0, deleted: 0 };
+		}
+
+		return await this.reconcileNormalizedRange(
+			"3min",
+			candidates,
+			bucketStarts[0],
+			bucketStarts[bucketStarts.length - 1],
+		);
 	}
 
 	private async deriveRecentFourHourFromOneHour() {
