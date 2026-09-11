@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v15.3-synthetic-micro-gap-bridge-5m-40k-2026-09-10";
+const BUILD_VERSION = "v15.4-forced-historical-3m-rederive-40k-2026-09-11";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -4555,6 +4555,11 @@ export class Chat extends DurableObject<LiveEnv> {
 				await this.deriveRecentThreeMinuteFromOneMinute();
 			}
 
+			// v15.4: recent 3M reconciliation only sees a short rolling window.
+			// If an older 3M gap survives while exact 1M source rows exist, rebuild
+			// that historical bucket directly from those 1M rows before readiness.
+			await this.forceRebuildHistoricalThreeMinuteGap();
+
 			const afterAudits: ContinuityAudit[] = [];
 			for (const interval of [
 				"1min",
@@ -5132,6 +5137,80 @@ export class Chat extends DurableObject<LiveEnv> {
 		};
 	}
 
+
+	private async forceRebuildHistoricalThreeMinuteGap() {
+		// v15.4: A historical 3M hole must be repaired locally from the exact
+		// Effective/normalized 1M source rows, even when the hole is older than
+		// the recent rolling derivation window. 3M is never fetched natively.
+		// This uses exact 1M keys, so an old synthetic bridge remains eligible.
+		const audit = await this.auditContinuity("3min");
+		if (!audit.gap) {
+			return { attempted: false, written: 0, unchanged: 0, deleted: 0 };
+		}
+
+		const gap = audit.gap;
+		const bucketStarts: string[] = [];
+		let cursor = gap.missing_from;
+		while (cursor <= gap.missing_to && bucketStarts.length < 100) {
+			bucketStarts.push(cursor);
+			cursor = addMinutesToCairoDatetime(cursor, 3);
+		}
+		if (bucketStarts.length === 0) {
+			return { attempted: true, written: 0, unchanged: 0, deleted: 0 };
+		}
+
+		const candidates: NormalizedCandle[] = [];
+		for (const bucketStart of bucketStarts) {
+			const expectedTimes = [
+				bucketStart,
+				addMinutesToCairoDatetime(bucketStart, 1),
+				addMinutesToCairoDatetime(bucketStart, 2),
+			];
+			const rows: NormalizedCandle[] = [];
+			for (const datetime of expectedTimes) {
+				const row = await this.ctx.storage.get<NormalizedCandle>(
+					normalizedCandleKey("1min", datetime),
+				);
+				if (row) rows.push(row);
+			}
+			if (
+				rows.length !== 3 ||
+				!expectedTimes.every((value, index) => rows[index]?.datetime === value)
+			) {
+				continue;
+			}
+
+			const expectedClose = addMinutesToCairoDatetime(bucketStart, 3);
+			if (statusFromExpectedClose(expectedClose) === "OPEN") continue;
+			const containsSynthetic = rows.some((c) => c.synthetic_gap === true);
+			candidates.push({
+				timeframe: "3min",
+				datetime: bucketStart,
+				open_time: bucketStart,
+				expected_close_time: expectedClose,
+				open: rows[0].open,
+				high: Math.max(...rows.map((c) => c.high)),
+				low: Math.min(...rows.map((c) => c.low)),
+				close: rows[2].close,
+				status: "CLOSED",
+				source: containsSynthetic
+					? "derived_1min_with_synthetic_bridge"
+					: "derived_1min",
+				provisional: false,
+				confirmed: true,
+				synthetic_gap: containsSynthetic,
+				gap_adjusted: rows.some((c) => c.gap_adjusted),
+				stored_at_ms: Date.now(),
+			});
+		}
+
+		return await this.reconcileNormalizedRange(
+			"3min",
+			candidates,
+			bucketStarts[0],
+			bucketStarts[bucketStarts.length - 1],
+		);
+	}
 
 	private async deriveRecentThreeMinuteFromOneMinute() {
 		// v15.1: recent derivation is a reconciliation, not append-only. If a
