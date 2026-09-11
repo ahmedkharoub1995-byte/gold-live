@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v15.4-forced-historical-3m-rederive-40k-2026-09-11";
+const BUILD_VERSION = "v15.5-targeted-historical-1m-bridge-3m-rederive-40k-2026-09-11";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -4555,9 +4555,18 @@ export class Chat extends DurableObject<LiveEnv> {
 				await this.deriveRecentThreeMinuteFromOneMinute();
 			}
 
-			// v15.4: recent 3M reconciliation only sees a short rolling window.
-			// If an older 3M gap survives while exact 1M source rows exist, rebuild
-			// that historical bucket directly from those 1M rows before readiness.
+			// v15.5: if the 3M gap is historical enough to fall outside the 1M
+			// continuity scan, inspect that exact historical 1M source window. Normal
+			// REST recovery has already run above; only now may the bounded synthetic
+			// bridge policy fill the source hole. Then rebuild the missing 3M rows.
+			const historicalSourceBridge =
+				await this.synthesizeHistoricalOneMinuteGapForThreeMinuteAudit();
+			if (historicalSourceBridge.created > 0) {
+				await this.forceRebuildHistoricalThreeMinuteGap();
+			}
+
+			// Always attempt a direct historical 3M rebuild from any exact 1M rows
+			// that already exist, even when no synthetic source row was required.
 			await this.forceRebuildHistoricalThreeMinuteGap();
 
 			const afterAudits: ContinuityAudit[] = [];
@@ -5134,6 +5143,105 @@ export class Chat extends DurableObject<LiveEnv> {
 			rows_written: writeStats.written,
 			rows_unchanged_skipped: writeStats.unchanged,
 			write_policy: "diff_upsert_only",
+		};
+	}
+
+
+	private async synthesizeHistoricalOneMinuteGapForThreeMinuteAudit() {
+		// v15.5: A historical 3M gap can be older than the 1M continuity scan
+		// horizon. In that case current 1M readiness may look clean even though
+		// the exact historical 1M source rows needed by the missing 3M bucket are
+		// absent. After normal REST recovery has already been attempted, inspect
+		// the 1M source window implied by the 3M gap directly. If that source hole
+		// is bounded by real/effective 1M candles and is no larger than the normal
+		// synthetic bridge policy, fill it deterministically, then let 3M rebuild.
+		const threeAudit = await this.auditContinuity("3min");
+		if (!threeAudit.gap) {
+			return { attempted: false, created: 0, candles: [] as string[] };
+		}
+
+		const gap = threeAudit.gap;
+		const sourceStart = addMinutesToCairoDatetime(gap.missing_from, -1);
+		const sourceEnd = addMinutesToCairoDatetime(gap.missing_to, 3);
+
+		// Read the exact persisted 1M source rows in/around the historical gap.
+		const sourcePage = await this.ctx.storage.list<NormalizedCandle>({
+			prefix: normalizedPrefix("1min"),
+		});
+		const source = Array.from(sourcePage.values())
+			.filter((c) => c.datetime >= sourceStart && c.datetime <= sourceEnd)
+			.sort((a, b) => a.datetime.localeCompare(b.datetime));
+
+		if (source.length < 2) {
+			return { attempted: true, created: 0, candles: [] as string[] };
+		}
+
+		const candidates: NormalizedCandle[] = [];
+		for (let i = 0; i < source.length - 1; i++) {
+			const before = source[i];
+			const after = source[i + 1];
+			const missing = this.countMissingMarketBuckets(
+				before.datetime,
+				after.datetime,
+				"1min",
+			);
+			if (
+				missing.count < 1 ||
+				missing.count > SYNTHETIC_MICRO_GAP_MAX_1M ||
+				!missing.first ||
+				!missing.last
+			) {
+				continue;
+			}
+			if (hasDeclaredClosureBetween(before.datetime, after.datetime)) continue;
+
+			// Only bridge holes that overlap the 1M source span required by the
+			// missing 3M interval; do not repair unrelated historical data here.
+			const overlapsRequiredSource =
+				missing.last >= gap.missing_from &&
+				missing.first <= addMinutesToCairoDatetime(gap.missing_to, 2);
+			if (!overlapsRequiredSource) continue;
+
+			const start = Number(before.close);
+			const end = Number(after.open);
+			if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+			const step = (end - start) / missing.count;
+
+			for (let n = 0; n < missing.count; n++) {
+				const datetime = addMinutesToCairoDatetime(before.datetime, n + 1);
+				const open = start + step * n;
+				const close = start + step * (n + 1);
+				const expectedClose = addMinutesToCairoDatetime(datetime, 1);
+				candidates.push({
+					timeframe: "1min",
+					datetime,
+					open_time: datetime,
+					expected_close_time: expectedClose,
+					open,
+					high: Math.max(open, close),
+					low: Math.min(open, close),
+					close,
+					status: "CLOSED",
+					source: "synthetic_bridge_approximation",
+					provisional: false,
+					confirmed: true,
+					synthetic_gap: true,
+					gap_adjusted: false,
+					stored_at_ms: Date.now(),
+				});
+			}
+		}
+
+		if (candidates.length === 0) {
+			return { attempted: true, created: 0, candles: [] as string[] };
+		}
+
+		const stats = await this.upsertNormalizedCandidates(candidates);
+		return {
+			attempted: true,
+			created: stats.written,
+			unchanged: stats.unchanged,
+			candles: candidates.map((c) => c.datetime),
 		};
 	}
 
