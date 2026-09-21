@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v15.5-targeted-historical-1m-bridge-3m-rederive-40k-2026-09-11";
+const BUILD_VERSION = "v15.6-bounded-storage-reads-2026-09-21";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -490,6 +490,13 @@ function normalizedMetaKey(
 	interval: AnalysisNormalizedInterval,
 ) {
 	return `normmeta:${interval}`;
+}
+
+// Durable Object storage `end` is exclusive. Appending a NUL byte creates
+// the smallest lexicographic key strictly after the exact key, allowing an
+// inclusive datetime range without widening the scan to the rest of a prefix.
+function storageExclusiveEndAfterExactKey(key: string) {
+	return `${key}\u0000`;
 }
 
 function normalizedIntervalMinutes(
@@ -2700,6 +2707,49 @@ export class Chat extends DurableObject<LiveEnv> {
 		return { written, unchanged };
 	}
 
+	private async listNormalizedRange(
+		interval: AnalysisNormalizedInterval,
+		fromDatetime: string,
+		toDatetime: string,
+	) {
+		if (fromDatetime > toDatetime) return [] as NormalizedCandle[];
+
+		const startKey = normalizedCandleKey(interval, fromDatetime);
+		const endKey = storageExclusiveEndAfterExactKey(
+			normalizedCandleKey(interval, toDatetime),
+		);
+		const rows: NormalizedCandle[] = [];
+		let startAfter: string | undefined;
+
+		while (true) {
+			const page = await this.ctx.storage.list<NormalizedCandle>({
+				...(startAfter ? { startAfter } : { start: startKey }),
+				end: endKey,
+				limit: 1000,
+			});
+			if (page.size === 0) break;
+			rows.push(...page.values());
+			if (page.size < 1000) break;
+			const keys = Array.from(page.keys()) as string[];
+			startAfter = keys[keys.length - 1];
+		}
+
+		return rows;
+	}
+
+	private async previousNormalizedCandle(
+		interval: AnalysisNormalizedInterval,
+		beforeDatetime: string,
+	) {
+		const page = await this.ctx.storage.list<NormalizedCandle>({
+			prefix: normalizedPrefix(interval),
+			end: normalizedCandleKey(interval, beforeDatetime),
+			reverse: true,
+			limit: 1,
+		});
+		return Array.from(page.values())[0] ?? null;
+	}
+
 	private async reconcileNormalizedRange(
 		interval: AnalysisNormalizedInterval,
 		candidates: NormalizedCandle[],
@@ -2711,31 +2761,22 @@ export class Chat extends DurableObject<LiveEnv> {
 			return { ...stats, deleted: 0 };
 		}
 
+		if (fromDatetime > toDatetime) {
+			return { ...stats, deleted: 0 };
+		}
+
 		const keep = new Set(candidates.map((c) => c.datetime));
 		const deleteKeys: string[] = [];
-		let startAfter: string | undefined;
+		const existingRange = await this.listNormalizedRange(
+			interval,
+			fromDatetime,
+			toDatetime,
+		);
 
-		while (true) {
-			const page = await this.ctx.storage.list<NormalizedCandle>({
-				prefix: normalizedPrefix(interval),
-				limit: 1000,
-				...(startAfter ? { startAfter } : {}),
-			});
-			if (page.size === 0) break;
-
-			for (const [key, candle] of page.entries()) {
-				if (
-					candle.datetime >= fromDatetime &&
-					candle.datetime <= toDatetime &&
-					!keep.has(candle.datetime)
-				) {
-					deleteKeys.push(key);
-				}
+		for (const candle of existingRange) {
+			if (!keep.has(candle.datetime)) {
+				deleteKeys.push(normalizedCandleKey(interval, candle.datetime));
 			}
-
-			if (page.size < 1000) break;
-			const keys = Array.from(page.keys()) as string[];
-			startAfter = keys[keys.length - 1];
 		}
 
 		for (let i = 0; i < deleteKeys.length; i += 100) {
@@ -4112,7 +4153,11 @@ export class Chat extends DurableObject<LiveEnv> {
 
 	private async auditContinuity(
 		interval: AnalysisNormalizedInterval,
+		cache?: Map<AnalysisNormalizedInterval, ContinuityAudit>,
 	): Promise<ContinuityAudit> {
+		const cached = cache?.get(interval);
+		if (cached) return cached;
+
 		const rows = await this.effectiveRowsForContinuity(interval);
 		const confirmed = rows.filter((row) => row.confirmed === true);
 		const provisional = rows.filter((row) => row.provisional === true);
@@ -4163,7 +4208,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			isClosedMarketCairoDatetime(cairoTime(Date.now())) ||
 			(latestMs !== null && Date.now() - latestMs <= allowedLagMs);
 
-		return {
+		const result: ContinuityAudit = {
 			interval,
 			latest_effective_datetime: latest?.datetime ?? null,
 			latest_confirmed_datetime:
@@ -4176,6 +4221,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			boundary_omission: boundaryOmission,
 			effective_fresh: effectiveFresh,
 		};
+		cache?.set(interval, result);
+		return result;
 	}
 
 
@@ -4389,8 +4436,9 @@ export class Chat extends DurableObject<LiveEnv> {
 		this.ensureAutoState();
 		this.autoState!.last_recovery_audit_ms = nowMs;
 		if (isClosedMarketCairoDatetime(cairoTime(nowMs))) return;
+		const auditCache = new Map<AnalysisNormalizedInterval, ContinuityAudit>();
 		for (const interval of RECOVERY_INTERVALS) {
-			const audit = await this.auditContinuity(interval);
+			const audit = await this.auditContinuity(interval, auditCache);
 			if (audit.gap) {
 				this.enqueueAutoRepair(
 					interval,
@@ -4418,14 +4466,15 @@ export class Chat extends DurableObject<LiveEnv> {
 		// provisional. In that case force a targeted 1H REST refresh ending at
 		// the next existing 4H bucket, then the normal post-refresh derivation
 		// rebuilds 4H from authoritative 1H history.
-		let fourHourAudit = await this.auditContinuity("4h");
+		let fourHourAudit = await this.auditContinuity("4h", auditCache);
 		if (fourHourAudit.gap) {
-			const oneHourAudit = await this.auditContinuity("1h");
+			const oneHourAudit = await this.auditContinuity("1h", auditCache);
 			// First rebuild the derived 4H layer from already-authoritative 1H.
 			// Only spend a REST recovery request if the source itself cannot fix it.
 			if (oneHourAudit.gap === null && oneHourAudit.effective_fresh) {
 				await this.deriveFourHourFromOneHour();
-				fourHourAudit = await this.auditContinuity("4h");
+				auditCache.delete("4h");
+				fourHourAudit = await this.auditContinuity("4h", auditCache);
 			}
 			if (fourHourAudit.gap) {
 				this.enqueueAutoRepair(
@@ -4448,9 +4497,15 @@ export class Chat extends DurableObject<LiveEnv> {
 			await this.ensureConnection();
 			this.ensureAutoState();
 
+			// Cache continuity audits only for this readiness execution. This keeps
+			// repeated checks exact while avoiding duplicate 1000-row scans of the
+			// same timeframe before anything has changed. The cache is cleared after
+			// any operation that may mutate normalized storage.
+			const auditCache = new Map<AnalysisNormalizedInterval, ContinuityAudit>();
+
 			const beforeAudits: ContinuityAudit[] = [];
 			for (const interval of RECOVERY_INTERVALS) {
-				const audit = await this.auditContinuity(interval);
+				const audit = await this.auditContinuity(interval, auditCache);
 				beforeAudits.push(audit);
 				if (audit.gap) {
 					this.enqueueAutoRepair(
@@ -4475,7 +4530,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			// 3M is derived from 1M. Never double-charge recovery when 1M already
 			// has the blocking source gap. If 1M is healthy, rebuild 3M locally
 			// first; only use REST if a source-side problem remains.
-			let threeMinuteBefore = await this.auditContinuity("3min");
+			let threeMinuteBefore = await this.auditContinuity("3min", auditCache);
 			beforeAudits.push(threeMinuteBefore);
 			if (
 				threeMinuteBefore.gap !== null ||
@@ -4483,11 +4538,12 @@ export class Chat extends DurableObject<LiveEnv> {
 			) {
 				const oneMinuteBefore =
 					beforeAudits.find((audit) => audit.interval === "1min") ??
-					await this.auditContinuity("1min");
+					await this.auditContinuity("1min", auditCache);
 
 				if (oneMinuteBefore.gap === null && oneMinuteBefore.effective_fresh) {
 					await this.deriveThreeMinuteFromOneMinute();
-					threeMinuteBefore = await this.auditContinuity("3min");
+					auditCache.delete("3min");
+					threeMinuteBefore = await this.auditContinuity("3min", auditCache);
 				}
 
 				if (
@@ -4511,16 +4567,17 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			// 4H is derived from confirmed 1H. If a closed 4H bucket is missing,
 			// force a targeted authoritative 1H refresh around that boundary.
-			let fourHourBefore = await this.auditContinuity("4h");
+			let fourHourBefore = await this.auditContinuity("4h", auditCache);
 			beforeAudits.push(fourHourBefore);
 			if (fourHourBefore.gap) {
 				const oneHourBefore =
 					beforeAudits.find((audit) => audit.interval === "1h") ??
-					await this.auditContinuity("1h");
+					await this.auditContinuity("1h", auditCache);
 
 				if (oneHourBefore.gap === null && oneHourBefore.effective_fresh) {
 					await this.deriveFourHourFromOneHour();
-					fourHourBefore = await this.auditContinuity("4h");
+					auditCache.delete("4h");
+					fourHourBefore = await this.auditContinuity("4h", auditCache);
 				}
 
 				if (fourHourBefore.gap) {
@@ -4544,6 +4601,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			if (repairRequested || queueHasWork) {
 				await this.persistAutoState();
 				await this.processAutoQueue();
+				auditCache.clear();
 				await this.scheduleAutoAlarm();
 			}
 
@@ -4552,7 +4610,9 @@ export class Chat extends DurableObject<LiveEnv> {
 			// 3M so analysis can proceed normally.
 			const syntheticBridge = await this.synthesizeSmallOneMinuteGaps();
 			if (syntheticBridge.created > 0) {
+				auditCache.delete("1min");
 				await this.deriveRecentThreeMinuteFromOneMinute();
+				auditCache.delete("3min");
 			}
 
 			// v15.5: if the 3M gap is historical enough to fall outside the 1M
@@ -4560,14 +4620,24 @@ export class Chat extends DurableObject<LiveEnv> {
 			// REST recovery has already run above; only now may the bounded synthetic
 			// bridge policy fill the source hole. Then rebuild the missing 3M rows.
 			const historicalSourceBridge =
-				await this.synthesizeHistoricalOneMinuteGapForThreeMinuteAudit();
+				await this.synthesizeHistoricalOneMinuteGapForThreeMinuteAudit(auditCache);
 			if (historicalSourceBridge.created > 0) {
-				await this.forceRebuildHistoricalThreeMinuteGap();
+				auditCache.delete("1min");
+				auditCache.delete("3min");
+				await this.forceRebuildHistoricalThreeMinuteGap(auditCache);
+				auditCache.delete("3min");
 			}
 
 			// Always attempt a direct historical 3M rebuild from any exact 1M rows
 			// that already exist, even when no synthetic source row was required.
-			await this.forceRebuildHistoricalThreeMinuteGap();
+			const historicalThreeMinuteRebuild =
+				await this.forceRebuildHistoricalThreeMinuteGap(auditCache);
+			if (
+				Number((historicalThreeMinuteRebuild as { written?: number }).written ?? 0) > 0 ||
+				Number((historicalThreeMinuteRebuild as { deleted?: number }).deleted ?? 0) > 0
+			) {
+				auditCache.delete("3min");
+			}
 
 			const afterAudits: ContinuityAudit[] = [];
 			for (const interval of [
@@ -4579,7 +4649,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				"1h",
 				"4h",
 			] as AnalysisNormalizedInterval[]) {
-				afterAudits.push(await this.auditContinuity(interval));
+				afterAudits.push(await this.auditContinuity(interval, auditCache));
 			}
 
 			const remainingProblems = afterAudits.filter(
@@ -5047,15 +5117,10 @@ export class Chat extends DurableObject<LiveEnv> {
 		if (raw.length === 0) return;
 
 		const earliest = raw[0].datetime;
-		const priorPage = await this.ctx.storage.list<NormalizedCandle>({
-			prefix: normalizedPrefix(interval),
-			reverse: true,
-			limit: 400,
-		});
-		const priorRows = Array.from(priorPage.values())
-			.filter((c) => c.datetime < earliest)
-			.sort((a, b) => b.datetime.localeCompare(a.datetime));
-		let previous = priorRows[0] ?? null;
+		// We only need the immediate confirmed predecessor to determine whether
+		// the first recent row crosses a declared closure. Reading hundreds of
+		// newer rows and filtering them in memory wastes Durable Object row reads.
+		let previous = await this.previousNormalizedCandle(interval, earliest);
 
 		let filtered = 0;
 		let gapAdjustedRows = 0;
@@ -5147,7 +5212,9 @@ export class Chat extends DurableObject<LiveEnv> {
 	}
 
 
-	private async synthesizeHistoricalOneMinuteGapForThreeMinuteAudit() {
+	private async synthesizeHistoricalOneMinuteGapForThreeMinuteAudit(
+		auditCache?: Map<AnalysisNormalizedInterval, ContinuityAudit>,
+	) {
 		// v15.5: A historical 3M gap can be older than the 1M continuity scan
 		// horizon. In that case current 1M readiness may look clean even though
 		// the exact historical 1M source rows needed by the missing 3M bucket are
@@ -5155,7 +5222,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		// the 1M source window implied by the 3M gap directly. If that source hole
 		// is bounded by real/effective 1M candles and is no larger than the normal
 		// synthetic bridge policy, fill it deterministically, then let 3M rebuild.
-		const threeAudit = await this.auditContinuity("3min");
+		const threeAudit = await this.auditContinuity("3min", auditCache);
 		if (!threeAudit.gap) {
 			return { attempted: false, created: 0, candles: [] as string[] };
 		}
@@ -5164,13 +5231,14 @@ export class Chat extends DurableObject<LiveEnv> {
 		const sourceStart = addMinutesToCairoDatetime(gap.missing_from, -1);
 		const sourceEnd = addMinutesToCairoDatetime(gap.missing_to, 3);
 
-		// Read the exact persisted 1M source rows in/around the historical gap.
-		const sourcePage = await this.ctx.storage.list<NormalizedCandle>({
-			prefix: normalizedPrefix("1min"),
-		});
-		const source = Array.from(sourcePage.values())
-			.filter((c) => c.datetime >= sourceStart && c.datetime <= sourceEnd)
-			.sort((a, b) => a.datetime.localeCompare(b.datetime));
+		// Read only the persisted 1M source rows in/around the historical gap.
+		// The old implementation listed the entire 1M prefix and filtered in JS,
+		// which made a tiny repair consume the whole historical read set.
+		const source = (await this.listNormalizedRange(
+			"1min",
+			sourceStart,
+			sourceEnd,
+		)).sort((a, b) => a.datetime.localeCompare(b.datetime));
 
 		if (source.length < 2) {
 			return { attempted: true, created: 0, candles: [] as string[] };
@@ -5246,12 +5314,14 @@ export class Chat extends DurableObject<LiveEnv> {
 	}
 
 
-	private async forceRebuildHistoricalThreeMinuteGap() {
+	private async forceRebuildHistoricalThreeMinuteGap(
+		auditCache?: Map<AnalysisNormalizedInterval, ContinuityAudit>,
+	) {
 		// v15.4: A historical 3M hole must be repaired locally from the exact
 		// Effective/normalized 1M source rows, even when the hole is older than
 		// the recent rolling derivation window. 3M is never fetched natively.
 		// This uses exact 1M keys, so an old synthetic bridge remains eligible.
-		const audit = await this.auditContinuity("3min");
+		const audit = await this.auditContinuity("3min", auditCache);
 		if (!audit.gap) {
 			return { attempted: false, written: 0, unchanged: 0, deleted: 0 };
 		}
@@ -5655,21 +5725,15 @@ export class Chat extends DurableObject<LiveEnv> {
 		startDatetime: string,
 		endDatetime: string,
 	) {
-		const confirmedPage =
-			await this.ctx.storage.list<NormalizedCandle>({
-				prefix: normalizedPrefix("1min"),
-				reverse: true,
-				limit: 600,
-			});
+		const confirmedRows = await this.listNormalizedRange(
+			"1min",
+			startDatetime,
+			endDatetime,
+		);
 
 		const merged = new Map<string, NormalizedCandle>();
-		for (const candle of confirmedPage.values()) {
-			if (
-				candle.datetime >= startDatetime &&
-				candle.datetime <= endDatetime
-			) {
-				merged.set(candle.datetime, candle);
-			}
+		for (const candle of confirmedRows) {
+			merged.set(candle.datetime, candle);
 		}
 
 		for (const live of this.candles) {
@@ -5784,12 +5848,11 @@ export class Chat extends DurableObject<LiveEnv> {
 		startDatetime: string,
 		endDatetime: string,
 	) {
-		const confirmedPage =
-			await this.ctx.storage.list<NormalizedCandle>({
-				prefix: normalizedPrefix(interval),
-				reverse: true,
-				limit: 500,
-			});
+		const confirmedRows = await this.listNormalizedRange(
+			interval,
+			startDatetime,
+			endDatetime,
+		);
 		const merged = new Map<string, NormalizedCandle>();
 
 		const derived = await this.deriveEffectiveIntradayFromOneMinute(
@@ -5802,13 +5865,8 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 
 		// Confirmed REST always wins over provisional reconstruction.
-		for (const candle of confirmedPage.values()) {
-			if (
-				candle.datetime >= startDatetime &&
-				candle.datetime <= endDatetime
-			) {
-				merged.set(candle.datetime, candle);
-			}
+		for (const candle of confirmedRows) {
+			merged.set(candle.datetime, candle);
 		}
 
 		return Array.from(merged.values()).sort((a, b) =>
@@ -5820,20 +5878,14 @@ export class Chat extends DurableObject<LiveEnv> {
 		startDatetime: string,
 		endDatetime: string,
 	) {
-		const confirmedPage =
-			await this.ctx.storage.list<NormalizedCandle>({
-				prefix: normalizedPrefix("1day"),
-				reverse: true,
-				limit: 40,
-			});
+		const confirmedRows = await this.listNormalizedRange(
+			"1day",
+			startDatetime,
+			endDatetime,
+		);
 		const merged = new Map<string, NormalizedCandle>();
-		for (const candle of confirmedPage.values()) {
-			if (
-				candle.datetime >= startDatetime &&
-				candle.datetime <= endDatetime
-			) {
-				merged.set(candle.datetime, candle);
-			}
+		for (const candle of confirmedRows) {
+			merged.set(candle.datetime, candle);
 		}
 
 		const current = await this.buildCurrentProvisional("1day");
@@ -5974,23 +6026,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			// confirmed weekly close, so the weekend discontinuity is absorbed
 			// inside the new weekly candle rather than inheriting the first
 			// Daily candle's gap-adjusted open.
-			const previousWeeklyPage =
-				await this.ctx.storage.list<NormalizedCandle>({
-					prefix: normalizedPrefix("1week"),
-					reverse: true,
-					limit: 20,
-				});
-
 			const previousConfirmedWeekly =
-				Array.from(previousWeeklyPage.values())
-					.filter(
-						(candle) =>
-							candle.confirmed === true &&
-							candle.datetime < bucketStart,
-					)
-					.sort((a, b) =>
-						b.datetime.localeCompare(a.datetime),
-					)[0] ?? null;
+				await this.previousNormalizedCandle("1week", bucketStart);
 
 			if (previousConfirmedWeekly) {
 				const anchoredOpen = previousConfirmedWeekly.close;
