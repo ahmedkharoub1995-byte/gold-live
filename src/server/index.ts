@@ -7481,7 +7481,17 @@ export default {
 			// quota recovery resets only the in-memory runtime, never its storage.
 			const id = env.Chat.idFromName(PROD_OBJECT_NAME);
 			const stub = env.Chat.get(id);
-			return await stub.fetch(request);
+
+			// A version-override header is only for smoke-testing the outer
+			// Worker version. Durable Objects are version-assigned separately
+			// during gradual deployments, so do not propagate that override
+			// into the production Durable Object subrequest. This also mirrors
+			// the MCP lane, which creates a fresh internal request.
+			const forwardedRequest = new Request(request);
+			forwardedRequest.headers.delete(
+				"Cloudflare-Workers-Version-Overrides",
+			);
+			return await stub.fetch(forwardedRequest);
 		} catch (error) {
 			const anyError = error as {
 				message?: unknown;
