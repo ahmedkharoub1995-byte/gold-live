@@ -13,12 +13,16 @@
 		"publish": true
 	},
 	"dependencies": {
+		"@modelcontextprotocol/client": "2.0.0",
+		"@modelcontextprotocol/server": "2.0.0",
+		"agents": "0.20.1",
 		"nanoid": "5.1.6",
 		"partyserver": "0.0.75",
 		"partysocket": "1.1.6",
 		"react": "19.2.1",
 		"react-dom": "19.2.1",
-		"react-router": "7.9.6"
+		"react-router": "7.9.6",
+		"zod": "^4.4.3"
 	},
 	"devDependencies": {
 		"@cloudflare/workers-types": "^4.20260702.1",
