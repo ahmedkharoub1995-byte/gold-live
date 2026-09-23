@@ -3,15 +3,15 @@ import { DurableObject } from "cloudflare:workers";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v15.7-incremental-continuity-targeted-recovery-2026-09-21";
+const BUILD_VERSION = "v15.9-authoritative-catchup-gap-queue-2026-09-23";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
 
-// Recovery work uses an internal conservative reservation budget. It is NOT an
-// actual Cloudflare SQL-rows-written counter and does not write one row per
-// estimated candle. Normal live/current storage is NOT paused by this budget;
-// only bootstrap/backfill/recovery work is paused.
+// Full bootstrap work uses an internal conservative reservation budget. It is NOT an
+// actual Cloudflare SQL-rows-written counter. Targeted continuity/staleness repairs
+// bypass this legacy budget because v15.7+ repairs are bounded to the affected range;
+// the provider request-rate guard remains the controlling safety limit.
 const RECOVERY_BUDGET_KEY = "recovery_write_budget_v1";
 const RECOVERY_SOFT_LIMIT_ROWS = 40_000;
 const RECOVERY_HARD_CEILING_ROWS = 60_000;
@@ -45,6 +45,14 @@ const RECOVERY_MAX_OUTPUTSIZE = 1150;
 const RECOVERY_NOOP_COOLDOWN_MS = 30 * 60_000;
 const RECOVERY_TARGET_OVERLAP_BUCKETS = 3;
 const SYNTHETIC_MICRO_GAP_MAX_1M = 5;
+
+// Quota-resilient lifecycle. The Durable Object constructor performs zero
+// storage I/O; persistent state is loaded lazily on the first storage-dependent
+// request/alarm. This keeps the SAME Durable Object addressable even while a
+// daily Durable Objects storage quota is refusing reads.
+const STORAGE_QUOTA_RESET_BUFFER_MS = 2 * 60_000;
+const STORAGE_QUOTA_POST_RESET_GRACE_MS = 15 * 60_000;
+const STORAGE_QUOTA_GRACE_RETRY_MS = 2 * 60_000;
 const CONTINUITY_INITIAL_SCAN_LIMIT = 1000;
 // Routine continuity checks verify only new data plus a safety overlap.
 // Historical coverage is preserved by the rotating deep scan below.
@@ -318,6 +326,10 @@ type ContinuityAudit = {
 	// block analysis readiness. We never synthesize a candle for it.
 	boundary_omission: ContinuityGap | null;
 	effective_fresh: boolean;
+	// Native REST timeframes must remain fresh independently of provisional data.
+	// This prevents a fresh 1M-derived tail from hiding a stale authoritative layer.
+	authoritative_fresh: boolean;
+	authoritative_lag_minutes: number | null;
 };
 
 type AutoRefreshState = {
@@ -325,6 +337,8 @@ type AutoRefreshState = {
 	queue: AutoQueueItem[];
 	last_5m_key: string;
 	last_15m_key: string;
+	// Optional for backwards compatibility with v15.8 persisted auto-state.
+	last_30m_key?: string;
 	last_hour_key: string;
 	last_4h_key: string;
 	last_day_key: string;
@@ -786,117 +800,359 @@ export class Chat extends DurableObject<LiveEnv> {
 	private subscribeStatus: unknown = null;
 	private autoState: AutoRefreshState | null = null;
 
+	// v15.8 lazy-storage lifecycle state. None of these fields are persisted;
+	// they exist only to stop repeated quota reads inside one runtime instance.
+	private storageLoaded = false;
+	private storageLoadPromise: Promise<boolean> | null = null;
+	private lastStorageReadError: string | null = null;
+	private lastStorageReadErrorMs: number | null = null;
+	private storageReadBlockedUntilMs: number | null = null;
+
 	constructor(ctx: DurableObjectState, env: LiveEnv) {
 		super(ctx, env);
 
-		ctx.blockConcurrencyWhile(async () => {
-			const saved = await ctx.storage.get<{
-				enabled?: boolean;
-				lastPrice?: number | null;
-				lastTickMs?: number | null;
-				tickCount?: number;
-				reconnectCount?: number;
-				currentCandle?: ProvisionalCandle | null;
-				candles?: ProvisionalCandle[];
-				lastError?: string | null;
-				lastStorageWriteError?: string | null;
-				lastStorageWriteErrorMs?: number | null;
-				lastStorageWriteSuccessMs?: number | null;
-				historicalStorageWriteError?: string | null;
-				subscribeStatus?: unknown;
-			}>("live_state");
+		// IMPORTANT: zero storage I/O in the constructor.
+		//
+		// A read-quota failure used to happen inside blockConcurrencyWhile(),
+		// preventing this Durable Object from booting at all. Persistent state is
+		// now loaded lazily by ensureStorageLoaded() after the instance is alive.
+	}
 
-			if (saved) {
-				this.enabled = saved.enabled ?? true;
-				this.tickCount = saved.tickCount ?? 0;
-				this.reconnectCount = saved.reconnectCount ?? 0;
+	private isStorageReadQuotaError(value: unknown) {
+		if (value == null) return false;
+		const message = value instanceof Error ? value.message : String(value);
+		return /(?:Exceeded allowed rows read|rows read in Durable Objects free tier|Durable Objects.*rows read|quota.*rows? read|quota.*read)/i.test(
+			message,
+		);
+	}
 
-				const savedLastError = saved.lastError ?? null;
-				this.lastStorageWriteError = saved.lastStorageWriteError ?? null;
-				this.lastStorageWriteErrorMs = saved.lastStorageWriteErrorMs ?? null;
-				this.lastStorageWriteSuccessMs = saved.lastStorageWriteSuccessMs ?? null;
+	private nextUtcQuotaResetProbeMs(now = Date.now()) {
+		const date = new Date(now);
+		const nextMidnightUtc = Date.UTC(
+			date.getUTCFullYear(),
+			date.getUTCMonth(),
+			date.getUTCDate() + 1,
+			0,
+			0,
+			0,
+			0,
+		);
+		return nextMidnightUtc + STORAGE_QUOTA_RESET_BUFFER_MS;
+	}
+
+	private quotaRetryAtMs(now = Date.now()) {
+		const date = new Date(now);
+		const msSinceUtcMidnight =
+			date.getUTCHours() * 60 * 60_000 +
+			date.getUTCMinutes() * 60_000 +
+			date.getUTCSeconds() * 1_000 +
+			date.getUTCMilliseconds();
+
+		// A small post-reset grace window handles the exact failure mode observed
+		// in production: the documented reset time has passed, yet one old object
+		// can briefly continue returning the previous quota error. Retry sparsely
+		// inside that window instead of sleeping for another full day.
+		if (msSinceUtcMidnight <= STORAGE_QUOTA_POST_RESET_GRACE_MS) {
+			return now + STORAGE_QUOTA_GRACE_RETRY_MS;
+		}
+		return this.nextUtcQuotaResetProbeMs(now);
+	}
+
+	private noteStorageReadQuotaFailure(error: unknown) {
+		const now = Date.now();
+		const message = error instanceof Error ? error.message : String(error);
+		this.lastStorageReadError = message;
+		this.lastStorageReadErrorMs = now;
+		this.storageReadBlockedUntilMs = this.quotaRetryAtMs(now);
+		this.lastError = message;
+		return this.storageReadBlockedUntilMs;
+	}
+
+	private clearStorageReadQuotaFailure() {
+		this.lastStorageReadError = null;
+		this.lastStorageReadErrorMs = null;
+		this.storageReadBlockedUntilMs = null;
+		if (
+			this.lastError !== null &&
+			this.isStorageReadQuotaError(this.lastError)
+		) {
+			this.lastError = null;
+		}
+	}
+
+	private storageQuotaRuntimeStatus() {
+		const now = Date.now();
+		return {
+			storage_loaded: this.storageLoaded,
+			read_status:
+				this.lastStorageReadError !== null ? "quota_blocked" : "ready_or_unprobed",
+			last_read_quota_error: this.lastStorageReadError,
+			last_read_quota_error_time:
+				this.lastStorageReadErrorMs !== null
+					? new Date(this.lastStorageReadErrorMs).toISOString()
+					: null,
+			blocked_until:
+				this.storageReadBlockedUntilMs !== null
+					? new Date(this.storageReadBlockedUntilMs).toISOString()
+					: null,
+			probe_allowed_now:
+				this.storageReadBlockedUntilMs === null ||
+				now >= this.storageReadBlockedUntilMs,
+		};
+	}
+
+	private async loadPersistentState() {
+		const saved = await this.ctx.storage.get<{
+			enabled?: boolean;
+			lastPrice?: number | null;
+			lastTickMs?: number | null;
+			tickCount?: number;
+			reconnectCount?: number;
+			currentCandle?: ProvisionalCandle | null;
+			candles?: ProvisionalCandle[];
+			lastError?: string | null;
+			lastStorageWriteError?: string | null;
+			lastStorageWriteErrorMs?: number | null;
+			lastStorageWriteSuccessMs?: number | null;
+			historicalStorageWriteError?: string | null;
+			subscribeStatus?: unknown;
+		}>("live_state");
+
+		if (saved) {
+			this.enabled = saved.enabled ?? true;
+			this.tickCount = saved.tickCount ?? 0;
+			this.reconnectCount = saved.reconnectCount ?? 0;
+
+			const savedLastError = saved.lastError ?? null;
+			this.lastStorageWriteError = saved.lastStorageWriteError ?? null;
+			this.lastStorageWriteErrorMs = saved.lastStorageWriteErrorMs ?? null;
+			this.lastStorageWriteSuccessMs = saved.lastStorageWriteSuccessMs ?? null;
+			this.historicalStorageWriteError =
+				saved.historicalStorageWriteError ?? null;
+
+			if (
+				savedLastError !== null &&
+				this.isStorageWriteErrorMessage(savedLastError)
+			) {
+				this.historicalStorageWriteError = savedLastError;
+				this.lastError = null;
+			} else if (!this.isStorageReadQuotaError(savedLastError)) {
+				this.lastError = savedLastError;
+			}
+			this.subscribeStatus = saved.subscribeStatus ?? null;
+
+			this.candles = (saved.candles ?? [])
+				.filter(
+					(candle) =>
+						!isClosedMarketCairoDatetime(candle.datetime),
+				)
+				.map((candle) => ({
+					...candle,
+					gap_adjusted: candle.gap_adjusted ?? false,
+				}));
+
+			const restoredCurrent = saved.currentCandle ?? null;
+			this.currentCandle =
+				restoredCurrent &&
+				!isClosedMarketCairoDatetime(restoredCurrent.datetime)
+					? {
+						...restoredCurrent,
+						gap_adjusted: restoredCurrent.gap_adjusted ?? false,
+					}
+					: null;
+
+			const lastValidLive =
+				this.currentCandle ??
+				this.candles[this.candles.length - 1] ??
+				null;
+			this.lastPrice = lastValidLive?.close ?? null;
+			this.lastTickMs = lastValidLive?.last_tick_ms ?? null;
+		}
+
+		const now = Date.now();
+		const nowCairo = cairoTime(now);
+		const savedAuto =
+			(await this.ctx.storage.get<AutoRefreshState>(AUTO_STATE_KEY)) ?? null;
+
+		if (savedAuto) {
+			this.autoState = savedAuto;
+			if (
+				this.autoState.last_error !== null &&
+				this.isStorageWriteErrorMessage(this.autoState.last_error)
+			) {
 				this.historicalStorageWriteError =
-					saved.historicalStorageWriteError ?? null;
-
-				// v14.6 could persist a quota failure into live_state and then keep
-				// reporting it forever even after writes recovered. Migrate that legacy
-				// value to informational history without exposing it as current last_error.
-				if (
-					savedLastError !== null &&
-					this.isStorageWriteErrorMessage(savedLastError)
-				) {
-					// v14.6 had no timestamped storage-health fields, so this value is
-					// historical by definition after a v14.7 deploy. Do not promote it to
-					// current storage health. A new failed write will set a current error.
-					this.historicalStorageWriteError = savedLastError;
-					this.lastError = null;
-				} else {
-					this.lastError = savedLastError;
-				}
-				this.subscribeStatus = saved.subscribeStatus ?? null;
-
-				// Remove any live candles produced by older versions during
-				// a known closed-market period. They must never enter analysis.
-				this.candles = (saved.candles ?? [])
-					.filter(
-						(candle) =>
-							!isClosedMarketCairoDatetime(
-								candle.datetime,
-							),
-					)
-					.map((candle) => ({
-						...candle,
-						gap_adjusted: candle.gap_adjusted ?? false,
-					}));
-
-				const restoredCurrent = saved.currentCandle ?? null;
-				this.currentCandle =
-					restoredCurrent &&
-					!isClosedMarketCairoDatetime(restoredCurrent.datetime)
-						? {
-							...restoredCurrent,
-							gap_adjusted:
-								restoredCurrent.gap_adjusted ?? false,
-						}
-						: null;
-
-				const lastValidLive =
-					this.currentCandle ??
-					this.candles[this.candles.length - 1] ??
-					null;
-
-				this.lastPrice = lastValidLive?.close ?? null;
-				this.lastTickMs = lastValidLive?.last_tick_ms ?? null;
+					this.historicalStorageWriteError ?? this.autoState.last_error;
+				this.autoState.last_error = null;
 			}
+		} else {
+			// Preserve controlled activation: deploy alone never starts bootstrap.
+			this.autoState = this.createInitialAutoState(nowCairo, now);
+			this.autoState.enabled = false;
+			this.autoState.queue = [];
+			this.autoState.bootstrap_pending = false;
+		}
+	}
 
-			const now = Date.now();
-			const nowCairo = cairoTime(now);
-			const savedAuto =
-				(await ctx.storage.get<AutoRefreshState>(AUTO_STATE_KEY)) ?? null;
+	private async ensureStorageLoaded(forceProbe = false) {
+		if (this.storageLoaded) {
+			return { ok: true as const, loaded_now: false };
+		}
 
-			if (savedAuto) {
-				this.autoState = savedAuto;
-				if (
-					this.autoState.last_error !== null &&
-					this.isStorageWriteErrorMessage(this.autoState.last_error)
-				) {
-					this.historicalStorageWriteError =
-						this.historicalStorageWriteError ?? this.autoState.last_error;
-					this.autoState.last_error = null;
+		const now = Date.now();
+		if (
+			!forceProbe &&
+			this.storageReadBlockedUntilMs !== null &&
+			now < this.storageReadBlockedUntilMs
+		) {
+			return {
+				ok: false as const,
+				quota_blocked: true,
+				error: this.lastStorageReadError,
+				retry_at_ms: this.storageReadBlockedUntilMs,
+			};
+		}
+
+		if (this.storageLoadPromise === null) {
+			this.storageLoadPromise = (async () => {
+				try {
+					await this.loadPersistentState();
+					this.storageLoaded = true;
+					this.clearStorageReadQuotaFailure();
+					return true;
+				} catch (error) {
+					if (this.isStorageReadQuotaError(error)) {
+						this.noteStorageReadQuotaFailure(error);
+					} else {
+						this.lastError =
+							error instanceof Error ? error.message : String(error);
+					}
+					return false;
+				} finally {
+					this.storageLoadPromise = null;
 				}
-			} else {
-				// Controlled activation remains preserved: deploy alone never starts bootstrap.
-				this.autoState = this.createInitialAutoState(nowCairo, now);
-				this.autoState.enabled = false;
-				this.autoState.queue = [];
-				this.autoState.bootstrap_pending = false;
-			}
+			})();
+		}
 
-			// Constructor stays strictly read-only: no put(), no setAlarm().
-		});
+		const loaded = await this.storageLoadPromise;
+		if (loaded) {
+			return { ok: true as const, loaded_now: true };
+		}
+		return {
+			ok: false as const,
+			quota_blocked: this.lastStorageReadError !== null,
+			error: this.lastStorageReadError ?? this.lastError,
+			retry_at_ms: this.storageReadBlockedUntilMs,
+		};
+	}
+
+	private async scheduleQuotaRecoveryAlarm(retryAtMs: number | null) {
+		if (retryAtMs === null) return false;
+		try {
+			await this.ctx.storage.setAlarm(retryAtMs);
+			this.markStorageWriteSuccess();
+			return true;
+		} catch (error) {
+			this.markStorageWriteFailure(error);
+			return false;
+		}
 	}
 
 	async fetch(request: Request) {
+		const url = new URL(request.url);
+
+		// These routes never require persistent storage. They remain available even
+		// while the storage read quota is refusing the production object.
+		if (url.pathname === "/instance-probe") {
+			return json({
+				status: "ok",
+				build_version: BUILD_VERSION,
+				instance_probe: true,
+				storage_io_attempted: false,
+				object_name: this.objectName(),
+				quota_runtime: this.storageQuotaRuntimeStatus(),
+			});
+		}
+
+		if (url.pathname === "/quota-status") {
+			return json({
+				status: "ok",
+				build_version: BUILD_VERSION,
+				object_name: this.objectName(),
+				quota_runtime: this.storageQuotaRuntimeStatus(),
+			});
+		}
+
+		if (url.pathname === "/runtime-reset-instance") {
+			this.ctx.abort("Manual quota recovery runtime reset", {
+				retryAlarm: false,
+			});
+		}
+
+		if (url.pathname === "/storage-probe") {
+			const loaded = await this.ensureStorageLoaded(true);
+			if (!loaded.ok) {
+				await this.scheduleQuotaRecoveryAlarm(loaded.retry_at_ms);
+				return json(
+					{
+						status: "degraded",
+						build_version: BUILD_VERSION,
+						storage_probe: false,
+						object_name: this.objectName(),
+						error: loaded.error,
+						quota_runtime: this.storageQuotaRuntimeStatus(),
+					},
+					503,
+				);
+			}
+			return json({
+				status: "ok",
+				build_version: BUILD_VERSION,
+				storage_probe: true,
+				object_name: this.objectName(),
+				quota_runtime: this.storageQuotaRuntimeStatus(),
+			});
+		}
+
+		const loaded = await this.ensureStorageLoaded();
+		if (!loaded.ok) {
+			await this.scheduleQuotaRecoveryAlarm(loaded.retry_at_ms);
+			return json(
+				{
+					status: "degraded",
+					build_version: BUILD_VERSION,
+					component: "durable_object_storage",
+					error: loaded.error,
+					note:
+						"Durable Object runtime is alive. Storage reads are circuit-broken until the next guarded probe; no object rotation or data deletion is required.",
+					quota_runtime: this.storageQuotaRuntimeStatus(),
+				},
+				503,
+			);
+		}
+
+		try {
+			return await this.handleFetch(request);
+		} catch (error) {
+			if (this.isStorageReadQuotaError(error)) {
+				const retryAtMs = this.noteStorageReadQuotaFailure(error);
+				await this.scheduleQuotaRecoveryAlarm(retryAtMs);
+				return json(
+					{
+						status: "degraded",
+						build_version: BUILD_VERSION,
+						component: "durable_object_storage",
+						error:
+							error instanceof Error ? error.message : String(error),
+						quota_runtime: this.storageQuotaRuntimeStatus(),
+					},
+					503,
+				);
+			}
+			throw error;
+		}
+	}
+
+	private async handleFetch(request: Request) {
 		const url = new URL(request.url);
 
 		// Zero-write instance probe. This route is used to distinguish an
@@ -3607,7 +3863,7 @@ export class Chat extends DurableObject<LiveEnv> {
 	private isStorageWriteErrorMessage(value: unknown) {
 		if (value == null) return false;
 		const message = String(value);
-		return /(Exceeded allowed rows written|rows written in Durable Objects|Durable Objects free tier|storage\s*write|SQLITE.*write|quota.*write)/i.test(message);
+		return /(?:Exceeded allowed rows written|rows written in Durable Objects|storage\s*write|SQLITE.*write|quota.*rows? written|quota.*write)/i.test(message);
 	}
 
 	private markStorageWriteFailure(error: unknown) {
@@ -3743,7 +3999,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			),
 			paused: budget.estimated_used_rows >= effectiveLimit,
 			note:
-				"Internal conservative recovery reservation only; it is not Cloudflare SQL rows written and does not increment per candle row. Live/current writes continue when recovery pauses.",
+				"Internal conservative FULL-BOOTSTRAP reservation only; it is not Cloudflare SQL rows written. Targeted gap/staleness recovery bypasses this legacy reservation and remains bounded by per-request size plus the 7 REST requests/minute guard.",
 		};
 	}
 
@@ -3753,6 +4009,13 @@ export class Chat extends DurableObject<LiveEnv> {
 			item.reason.includes("backfill") ||
 			item.reason.includes("recovery")
 		);
+	}
+
+	private isRecoveryBudgetGuardedWork(item: AutoQueueItem) {
+		// The legacy 40K reservation remains only for full bootstrap work.
+		// Exact gap repairs and stale authoritative-tail catch-up are targeted and
+		// remain bounded by outputsize + the global 7 REST requests/minute guard.
+		return item.reason.includes("bootstrap");
 	}
 
 	private estimateRecoveryWriteCost(item: AutoQueueItem) {
@@ -3859,6 +4122,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			queue: [],
 			last_5m_key: scheduleBucketKey(nowCairo, 5),
 			last_15m_key: scheduleBucketKey(nowCairo, 15),
+			last_30m_key: scheduleBucketKey(nowCairo, 30),
 			last_hour_key: scheduleBucketKey(nowCairo, 60),
 			last_4h_key: fourHourScheduleKey(nowCairo),
 			last_day_key: dateKey(nowCairo),
@@ -3885,6 +4149,12 @@ export class Chat extends DurableObject<LiveEnv> {
 				now,
 			);
 		}
+		// v15.9 migration-in-place: old persisted v15.8 state has no 30M key.
+		// Initialize it without forcing a duplicate fetch; stale-tail recovery below
+		// independently catches any authoritative history missed before this deploy.
+		if (this.autoState.last_30m_key == null) {
+			this.autoState.last_30m_key = scheduleBucketKey(cairoTime(Date.now()), 30);
+		}
 	}
 
 	private enqueueAutoIntervals(
@@ -3898,7 +4168,11 @@ export class Chat extends DurableObject<LiveEnv> {
 
 		for (const interval of intervals) {
 			const existing = state.queue.find(
-				(item) => item.interval === interval,
+				(item) =>
+					item.interval === interval &&
+					(item.before ?? null) === null &&
+					item.target_gap == null &&
+					!item.reason.includes("bootstrap"),
 			);
 
 			if (existing) {
@@ -4542,6 +4816,15 @@ export class Chat extends DurableObject<LiveEnv> {
 		const effectiveFresh =
 			isClosedMarketCairoDatetime(nowCairo) ||
 			(latestMs !== null && Date.now() - latestMs <= allowedLagMs);
+		const latestConfirmedMs = latestConfirmed
+			? cairoDatetimeToMs(latestConfirmed.datetime)
+			: null;
+		const authoritativeLagMinutes = latestConfirmedMs !== null
+			? Math.max(0, Math.floor((Date.now() - latestConfirmedMs) / 60_000))
+			: null;
+		const authoritativeFresh =
+			isClosedMarketCairoDatetime(nowCairo) ||
+			(latestConfirmedMs !== null && Date.now() - latestConfirmedMs <= allowedLagMs);
 
 		const result: ContinuityAudit = {
 			interval: tracked,
@@ -4551,18 +4834,22 @@ export class Chat extends DurableObject<LiveEnv> {
 			gap,
 			boundary_omission: fastScan.boundary_omission,
 			effective_fresh: effectiveFresh,
+			authoritative_fresh: authoritativeFresh,
+			authoritative_lag_minutes: authoritativeLagMinutes,
 		};
 		cache?.set(interval, result);
 		return result;
 	}
 
-	private enqueuePendingActiveGapRecoveries(maxToEnqueue = 3) {
+	private enqueuePendingActiveGapRecoveries() {
 		this.ensureAutoState();
 		const gaps = Object.values(this.autoState!.continuity_active_gaps ?? {})
 			.sort((a, b) => b.missing_from.localeCompare(a.missing_from));
 		let enqueued = 0;
 		for (const gap of gaps) {
-			if (enqueued >= maxToEnqueue) break;
+			// Queue every known exact gap. Execution is still globally throttled by
+			// AUTO_MAX_REQUESTS_PER_WINDOW=7, so removing the old 3-gap enqueue cap
+			// does not create a provider burst. Existing items are deduplicated.
 			if (this.enqueueRecoveryForContinuityGap(gap, "active_gap_retry")) {
 				enqueued++;
 			}
@@ -4825,16 +5112,11 @@ export class Chat extends DurableObject<LiveEnv> {
 		this.ensureAutoState();
 		const state = this.autoState!;
 		if (
-			this.isRecoveryWork({
-				interval,
-				outputsize,
-				before,
-				reason,
-				enqueued_ms: Date.now(),
-				attempts: 0,
-			}) &&
+			targetGap !== null &&
 			this.isRecoveryNoopCoolingDown(interval, before)
 		) {
+			// Cooldown applies only to a specific exact gap that the provider could
+			// not fill. A stale authoritative tail must keep catching up normally.
 			return false;
 		}
 		const existing = state.queue.find(
@@ -4869,7 +5151,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				this.enqueueRecoveryForContinuityGap(audit.gap, "auto_recovery");
 				continue;
 			}
-			if (!audit.effective_fresh) {
+			if (!audit.authoritative_fresh) {
 				this.enqueueAutoRepair(
 					interval,
 					this.recoveryOutputsizeForStaleness(
@@ -4912,12 +5194,21 @@ export class Chat extends DurableObject<LiveEnv> {
 		// persisted, so repeated alarms walk the whole retained history without
 		// turning every five-minute check into a full historical re-read.
 		await this.runRotatingDeepContinuityScan();
-		// Retry a few persisted gaps per audit. Cooldowns are enforced inside
-		// enqueueAutoRepair(), so an irrecoverable newest gap cannot starve older
-		// gaps and cannot create a tight retry loop.
-		this.enqueuePendingActiveGapRecoveries(3);
+		// Queue every persisted exact gap on each audit. Exact-gap cooldowns are
+		// enforced inside enqueueAutoRepair(); the global 7/minute executor limit
+		// controls provider load while preventing an arbitrary 3-gap bottleneck.
+		this.enqueuePendingActiveGapRecoveries();
 	}
 
+
+	private auditHasBlockingProblem(audit: ContinuityAudit) {
+		if (audit.gap !== null || !audit.effective_fresh) return true;
+		// Native REST layers must be authoritative-fresh as well. Derived 3M/4H
+		// are validated through their effective/source continuity paths instead.
+		return (RECOVERY_INTERVALS as readonly string[]).includes(audit.interval)
+			? !audit.authoritative_fresh
+			: false;
+	}
 
 	private async ensureGoldDataReady() {
 		try {
@@ -4937,7 +5228,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				beforeAudits.push(audit);
 				if (audit.gap) {
 					this.enqueueRecoveryForContinuityGap(audit.gap, "gpt_recovery");
-				} else if (!audit.effective_fresh) {
+				} else if (!audit.authoritative_fresh) {
 					this.enqueueAutoRepair(
 						interval,
 						this.recoveryOutputsizeForStaleness(
@@ -5026,8 +5317,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				}
 			}
 
-			const repairRequested = beforeAudits.some(
-				(audit) => audit.gap !== null || !audit.effective_fresh,
+			const repairRequested = beforeAudits.some((audit) =>
+				this.auditHasBlockingProblem(audit),
 			);
 
 			const queueHasWork = this.autoState!.queue.length > 0;
@@ -5085,8 +5376,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				afterAudits.push(await this.auditContinuity(interval, auditCache));
 			}
 
-			const remainingProblems = afterAudits.filter(
-				(audit) => audit.gap !== null || !audit.effective_fresh,
+			const remainingProblems = afterAudits.filter((audit) =>
+				this.auditHasBlockingProblem(audit),
 			);
 
 			// Fallback only: v15.2 normally bridges one/two isolated 1M omissions. If a
@@ -5109,8 +5400,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				(threeMinuteAfter.gap === null ||
 					(threeMinuteAfter.gap.missing_buckets === 1 &&
 					 threeMinuteAfter.gap.missing_market_minutes === 3));
-			const higherFramesHealthy = higherAfter.every(
-				(audit) => audit.gap === null && audit.effective_fresh,
+			const higherFramesHealthy = higherAfter.every((audit) =>
+				!this.auditHasBlockingProblem(audit),
 			);
 			const onlyMicroProblems = remainingProblems.every((audit) =>
 				audit.interval === "1min" || audit.interval === "3min",
@@ -5191,6 +5482,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		const marketClosed = isClosedMarketCairoDatetime(nowCairo);
 		const fiveKey = scheduleBucketKey(nowCairo, 5);
 		const fifteenKey = scheduleBucketKey(nowCairo, 15);
+		const thirtyKey = scheduleBucketKey(nowCairo, 30);
 		const hourKey = scheduleBucketKey(nowCairo, 60);
 		const fourKey = fourHourScheduleKey(nowCairo);
 		const currentDateKey = dateKey(nowCairo);
@@ -5200,7 +5492,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			state.last_5m_key = fiveKey;
 			if (!marketClosed) {
 				this.enqueueAutoIntervals(
-					["1min"],
+					["5min", "1min"],
 					AUTO_INCREMENTAL_OUTPUTSIZE,
 					"5m_cadence",
 				);
@@ -5211,9 +5503,20 @@ export class Chat extends DurableObject<LiveEnv> {
 			state.last_15m_key = fifteenKey;
 			if (!marketClosed) {
 				this.enqueueAutoIntervals(
-					["5min", "1min"],
+					["15min"],
 					AUTO_INCREMENTAL_OUTPUTSIZE,
 					"15m_cadence",
+				);
+			}
+		}
+
+		if (thirtyKey !== state.last_30m_key) {
+			state.last_30m_key = thirtyKey;
+			if (!marketClosed) {
+				this.enqueueAutoIntervals(
+					["30min"],
+					AUTO_INCREMENTAL_OUTPUTSIZE,
+					"30m_cadence",
 				);
 			}
 		}
@@ -5222,7 +5525,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			state.last_hour_key = hourKey;
 			if (!marketClosed) {
 				this.enqueueAutoIntervals(
-					["30min", "15min", "5min", "1min"],
+					["1h"],
 					AUTO_INCREMENTAL_OUTPUTSIZE,
 					"hour_cadence",
 				);
@@ -5233,7 +5536,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			state.last_4h_key = fourKey;
 			if (!marketClosed) {
 				this.enqueueAutoIntervals(
-					["4h", "1h", "30min", "15min", "5min", "1min"],
+					["4h"],
 					AUTO_INCREMENTAL_OUTPUTSIZE,
 					"4h_close",
 				);
@@ -5424,14 +5727,13 @@ export class Chat extends DurableObject<LiveEnv> {
 			let item = state.queue[itemIndex];
 			let reservedRecoveryRows = 0;
 
-			if (this.isRecoveryWork(item)) {
+			if (this.isRecoveryBudgetGuardedWork(item)) {
 				const check = await this.canRunRecoveryItem(item);
 				if (!check.allowed) {
-					// Recovery pauses, but normal current-cadence refreshes are still
-					// allowed to run so live/current operation is never frozen by the
-					// 40K soft recovery budget.
+					// Full bootstrap pauses at the legacy internal reservation, but current
+					// cadence and targeted recovery remain eligible to run.
 					const liveIndex = state.queue.findIndex(
-						(candidate) => !this.isRecoveryWork(candidate),
+						(candidate) => !this.isRecoveryBudgetGuardedWork(candidate),
 					);
 					if (liveIndex < 0) {
 						state.last_error =
@@ -5482,15 +5784,21 @@ export class Chat extends DurableObject<LiveEnv> {
 							item.interval as RecoveryInterval,
 							item.before ?? null,
 						);
-						const rowsWritten = Number(
-							(result as { rows_written?: number }).rows_written ?? 0,
-						);
-						const sameGapStillPresent =
-							await this.recoveryGapStillPresentForItem(item);
-						if (rowsWritten === 0 || sameGapStillPresent) {
-							state.recovery_noop_until_ms[key] =
-								Date.now() + RECOVERY_NOOP_COOLDOWN_MS;
+						if (item.target_gap) {
+							const rowsWritten = Number(
+								(result as { rows_written?: number }).rows_written ?? 0,
+							);
+							const sameGapStillPresent =
+								await this.recoveryGapStillPresentForItem(item);
+							if (rowsWritten === 0 || sameGapStillPresent) {
+								state.recovery_noop_until_ms[key] =
+									Date.now() + RECOVERY_NOOP_COOLDOWN_MS;
+							} else {
+								delete state.recovery_noop_until_ms[key];
+							}
 						} else {
+							// Stale-tail catch-up is not an irrecoverable exact gap. Never leave
+							// a legacy 30-minute no-op cooldown blocking normal authoritative refresh.
 							delete state.recovery_noop_until_ms[key];
 						}
 					}
@@ -5519,7 +5827,36 @@ export class Chat extends DurableObject<LiveEnv> {
 		await this.persistAutoState();
 	}
 
+
 	async alarm() {
+		if (this.isRetiredInstance()) {
+			// Retired instances do not need persistent reads to identify themselves.
+			try {
+				await this.retireThisInstance();
+			} catch {}
+			return;
+		}
+
+		const loaded = await this.ensureStorageLoaded();
+		if (!loaded.ok) {
+			await this.scheduleQuotaRecoveryAlarm(loaded.retry_at_ms);
+			return;
+		}
+
+		try {
+			await this.handleAlarm();
+		} catch (error) {
+			if (this.isStorageReadQuotaError(error)) {
+				const retryAtMs = this.noteStorageReadQuotaFailure(error);
+				await this.scheduleQuotaRecoveryAlarm(retryAtMs);
+				return;
+			}
+			this.lastError =
+				error instanceof Error ? error.message : String(error);
+		}
+	}
+
+	private async handleAlarm() {
 		try {
 			if (this.isRetiredInstance()) {
 				await this.retireThisInstance();
@@ -5593,6 +5930,11 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			await this.scheduleAutoAlarm(delay);
 		} catch (error) {
+			if (this.isStorageReadQuotaError(error)) {
+				const retryAtMs = this.noteStorageReadQuotaFailure(error);
+				await this.scheduleQuotaRecoveryAlarm(retryAtMs);
+				return;
+			}
 			this.lastError =
 				error instanceof Error ? error.message : String(error);
 			return;
@@ -6947,7 +7289,7 @@ export default {
 				);
 				const probeStub = env.Chat.get(probeId);
 				const probeUrl = new URL(request.url);
-				probeUrl.pathname = "/instance-probe";
+				probeUrl.pathname = "/storage-probe";
 				probeUrl.search = "";
 				return await probeStub.fetch(
 					new Request(probeUrl.toString(), {
@@ -7041,7 +7383,7 @@ export default {
 				const probeId = env.Chat.idFromName(objectName);
 				const probeStub = env.Chat.get(probeId);
 				const probeUrl = new URL(request.url);
-				probeUrl.pathname = "/instance-probe";
+				probeUrl.pathname = "/storage-probe";
 				probeUrl.search = "";
 				return await probeStub.fetch(
 					new Request(probeUrl.toString(), {
@@ -7080,10 +7422,47 @@ export default {
 			}
 		}
 
+
+		if (url.pathname === "/runtime-reset") {
+			const id = env.Chat.idFromName(PROD_OBJECT_NAME);
+			const stub = env.Chat.get(id);
+			const resetUrl = new URL(request.url);
+			resetUrl.pathname = "/runtime-reset-instance";
+			resetUrl.search = "";
+			try {
+				await stub.fetch(
+					new Request(resetUrl.toString(), {
+						method: "POST",
+						headers: request.headers,
+					}),
+				);
+				return json({
+					status: "reset_requested",
+					build_version: BUILD_VERSION,
+					production_object_name: PROD_OBJECT_NAME,
+					note:
+						"Runtime reset request completed. Persistent Durable Object storage was not deleted.",
+				}, 202);
+			} catch (error) {
+				// ctx.abort() intentionally terminates the in-memory Durable Object,
+				// so the stub request normally rejects. Treat that as a successful
+				// reset request; the next call creates a fresh runtime for the SAME ID.
+				return json({
+					status: "reset_requested",
+					build_version: BUILD_VERSION,
+					production_object_name: PROD_OBJECT_NAME,
+					note:
+						"Durable Object runtime was aborted intentionally. Persistent storage remains attached to the same object ID.",
+					runtime_message:
+						error instanceof Error ? error.message : String(error),
+				}, 202);
+			}
+		}
+
 		try {
-			// Production traffic is intentionally moved to a fresh logical Durable
-			// Object instance. The legacy XAUUSD instance remains untouched so its
-			// stored data can be preserved for later inspection/recovery.
+			// Production traffic continues to use the SAME logical Durable
+			// Object instance. v15.8 does not rotate or replace the production ID;
+			// quota recovery resets only the in-memory runtime, never its storage.
 			const id = env.Chat.idFromName(PROD_OBJECT_NAME);
 			const stub = env.Chat.get(id);
 			return await stub.fetch(request);
@@ -7117,4 +7496,3 @@ export default {
 		}
 	},
 };
- 
