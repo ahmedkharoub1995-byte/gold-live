@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { handleGoldMcpRequest } from "./mcp";
 
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
@@ -7261,8 +7262,23 @@ export default {
 	async fetch(
 		request: Request,
 		env: LiveEnv,
+		ctx: ExecutionContext,
 	) {
 		const url = new URL(request.url);
+
+		// New stateless MCP lane for the Gold Swing Plugin. MCP protocol
+		// discovery/list requests stay in the outer Worker. Only an actual
+		// tool call is forwarded to the SAME production Durable Object used
+		// by the existing REST routes, so there is no second MCP Durable
+		// Object, no new storage schema, and no duplicated recovery state.
+		if (url.pathname === "/mcp") {
+			return handleGoldMcpRequest(
+				request,
+				env,
+				ctx,
+				PROD_OBJECT_NAME,
+			);
+		}
 
 		if (url.pathname === "/ping" || url.pathname === "/version") {
 			return json({
