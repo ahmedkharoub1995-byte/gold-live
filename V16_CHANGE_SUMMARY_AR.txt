@@ -1,0 +1,71 @@
+GOLD LIVE v16.0 — ملخص التعديل
+التاريخ: 2026-09-25
+
+الوضع قبل التعديل
+- الإنتاج الحالي كان على فرع mcp-test، Version a1621820، بنسبة 100%.
+- main Version 2ab8c218 كان 0%.
+- mcp-test هو نفس Gold Data Engine مع إضافة /mcp وملف src/server/mcp.ts، ويستخدم نفس Durable Object Chat ونفس PROD_OBJECT_NAME ونفس التخزين.
+- لا يوجد Durable Object جديد ولا Storage جديد للـMCP.
+
+لماذا احتجنا v16
+1) Historical gap recovery في v15.9 كان يعتمد على end_date + outputsize (backward page). عند فجوة قديمة قرب session/weekend boundary قد يرجع الطلب صفحة لا تصل أصلًا إلى مكان الفجوة، فتظل الفجوة في queue وتدخل cooldown ثم تعاد المحاولة بنفس النمط.
+2) 3M مشتق من 1M. بعض فجوات 3M المنفردة يمكن أن تبقى إذا وصلت 1M المتأخرة بعد خروج ذلك الوقت من نافذة deriveRecent الصغيرة.
+3) 4H confirmed مشتق من 1H، لكن الـscheduler كان لا يزال يستهلك REST request مباشر لـ4H رغم أن طبقة التحليل لا تعتمد عليه. كذلك stale 4H tail كان يمكن أن يختبئ خلف provisional حديث.
+4) Queue القديمة يمكن أن تحتوي historical recovery items بصيغة v15.9.
+
+ما الذي تغير في v16
+- BUILD_VERSION = v16.0-exact-gap-self-heal-derived-catchup-2026-09-25
+- كل historical gap أصبح لها exact range: start_date + end_date حول نفس missing span مع overlap محدود.
+- Queue items الجديدة تحمل range_start وrange_end، والـpublic auto state يعرضهما للتشخيص.
+- أي persisted v15.9 targeted-gap queue item يتحول تلقائيًا in-place إلى exact-range item عند تحميل auto state؛ لا purge ولا reset للبيانات.
+- كل active 3M/4H gaps تحاول Local Rebuild أولًا من 1M/1H قبل استهلاك Twelve Data REST credit.
+- إذا ظل 3M gap بعد local rebuild، يُطلب exact 1M source range فقط.
+- إذا ظل 4H gap بعد local rebuild، يُطلب exact 1H source range فقط.
+- 4H stale confirmed tail أصبح blocking حتى لو provisional 4H حديث.
+- إذا 1H authoritative حديث: rebuild 4H محليًا.
+- إذا 1H authoritative متأخر: catch-up لـ1H ثم rebuild 4H.
+- أزيلت الـscheduled 4H REST requests من cadence/day/week/month queues لأنها لا تحدث طبقة 4H التحليلية؛ manual 4H functionality ما زالت موجودة للتوافق.
+- Queue priority أصبحت: stale authoritative tail أولًا، ثم current work، ثم exact historical gaps من الأحدث للأقدم، ثم bootstrap.
+- سقف Twelve Data الآمن يظل 7 REST requests/minute.
+- Exact-gap cooldown أصبح مربوطًا بنفس exact range، وليس cursor عام.
+- 1M exact gaps الصغيرة (<=5) ما زال يمكن عمل synthetic fallback لها بعد محاولة REST الحقيقية، بنفس tagging والسياسة القديمة؛ gaps الكبيرة لا يتم اختلاقها.
+- manual /sync و /historical أصبحا يقبلان start_date و end_date أيضًا للتشخيص أو الإصلاح اليدوي.
+- Cadence diagnostic strings صححت لتطابق السلوك الفعلي: 5M كل 5 دقائق، 15M كل 15 دقيقة، 30M كل 30 دقيقة، 1H كل ساعة، 4H derived locally.
+
+أمثلة على الفجوات الحالية بعد v16
+- 1M 2026-09-18 23:25→23:59: exact provider window تقريبًا 23:23→00:01.
+- 3M 2026-09-18 23:24→23:57: local rebuild من 1M أولًا؛ وإذا المصدر ناقص، exact 1M window تقريبًا 23:22→00:01.
+- 5M 23:15→23:55: exact 5M range حول نفس الفترة بدل backward page بعيد.
+- 15M 23:00→23:45 و30M 23:00→23:30: نفس الفكرة.
+- 3M gaps المنفردة في 24 Sep: local rebuild من persisted 1M في كل active gap قبل أي REST.
+- 4H gap=null لكن confirmed tail متأخر: يتم التعامل معه كـstale-tail problem، 1H catch-up/rebuild بدل انتظار gap بين شمعتين.
+
+ما لم يتغير
+- PROD_OBJECT_NAME كما هو: XAUUSD_V14_6_PROD_20260909
+- Durable Object class/binding كما هو: Chat
+- لا migrations جديدة.
+- لا تغيير في wrangler migration tag.
+- لا حذف history.
+- لا purge.
+- لا retire.
+- لا Storage جديد.
+- MCP route والـMCP tools لم تتغير.
+- mcp-test يحتفظ بـnodejs_compat وMCP dependencies.
+- main يظل بدون MCP.
+
+ملاحظة عن السبب الأصلي للفجوات
+الكود يثبت لماذا الفجوات القديمة كانت تستطيع أن تبقى ولا تُصلح ذاتيًا بسرعة (backward paging + derived repair window + 4H scheduling). أما الحدث الذي أنشأ أول missing raw candles أصلًا في 18/22 Sep فلا يمكن إثباته من source code وحده؛ قد يكون outage/quota/runtime/ingestion miss. v16 مصمم بحيث حتى لو حدث miss مشابه مرة أخرى، النظام يكتشفه ثم يطلب نفس النطاق المفقود ويعيد بناء الطبقات المشتقة بدل أن تتراكم الفجوات.
+
+طريقة النشر الموصى بها
+1) حدث فرع mcp-test أولًا بالكود الجديد؛ لأنه هو الإنتاج الحالي.
+2) أنشئ Version جديدة من mcp-test.
+3) اعمل Deployment للVersion الجديدة بنسبة 100%، والنسخة a1621820 تصبح 0%.
+4) لا تعمل split 10/90 أو 50/50 لهذا الإصلاح؛ الـproduction named Durable Object يجب أن يُسند بوضوح إلى v16.
+5) لا تغير Durable Object name ولا binding ولا migration.
+6) بعد نجاح v16، حدّث main بنفس core changes فقط، لكن اترك main غير نشط/0% ما لم تكن تريد الرجوع له لاحقًا.
+7) بعد deployment افحص /version ثم /system-check ثم readiness/active gaps والـqueue range_start/range_end.
+
+Testing notes
+- Local TypeScript check على النسخة الجديدة أعاد نفس baseline errors الموجودة قبل التعديل فقط؛ لم تظهر أخطاء جديدة خاصة بتعديلات v16.
+- baseline main والجديد كلاهما يظهران نفس workers-types connect visibility mismatch في بيئة الاختبار المحلية.
+- baseline mcp-test والجديد كلاهما يظهران نفس ذلك الخطأ + missing MCP packages لأن dependencies غير مثبتة داخل الـZIP المحلي.
