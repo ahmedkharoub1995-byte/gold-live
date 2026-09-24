@@ -4,7 +4,7 @@ import { handleGoldMcpRequest } from "./mcp";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v15.9-authoritative-catchup-gap-queue-2026-09-23";
+const BUILD_VERSION = "v16.0-exact-gap-self-heal-derived-catchup-2026-09-25";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -300,8 +300,12 @@ type AutoQueueItem = {
 	reason: string;
 	enqueued_ms: number;
 	attempts: number;
-	// Optional targeted REST end_date cursor used by continuity backfill.
+	// Legacy/current-tail REST end_date cursor. Historical exact-gap recovery uses
+	// range_start/range_end instead so the provider is asked for the missing span
+	// itself rather than a backward page that may never reach the gap.
 	before?: string | null;
+	range_start?: string | null;
+	range_end?: string | null;
 	// Exact continuity gap that caused this recovery item. Persisting the target
 	// lets us verify old gaps without re-scanning a large recent window.
 	target_gap?: ContinuityGap | null;
@@ -1449,11 +1453,15 @@ export class Chat extends DurableObject<LiveEnv> {
 			}
 
 			const before = url.searchParams.get("before");
+			const rangeStart = url.searchParams.get("start_date");
+			const rangeEnd = url.searchParams.get("end_date");
 
 			const result = await this.syncHistoricalInterval(
 				requestedInterval,
 				outputsize,
 				before,
+				rangeStart,
+				rangeEnd,
 			);
 
 			if (result.status === "ok") {
@@ -1461,10 +1469,15 @@ export class Chat extends DurableObject<LiveEnv> {
 					{
 						interval: requestedInterval,
 						outputsize,
-						reason: before ? "manual_backfill" : "manual_sync",
+						reason:
+							before || rangeStart || rangeEnd
+								? "manual_backfill"
+								: "manual_sync",
 						enqueued_ms: Date.now(),
 						attempts: 0,
 						before,
+						range_start: rangeStart,
+						range_end: rangeEnd,
 					},
 					result,
 				);
@@ -2133,6 +2146,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			}
 
 			const before = url.searchParams.get("before");
+			const rangeStart = url.searchParams.get("start_date");
+			const rangeEnd = url.searchParams.get("end_date");
 
 			let outputsize = Number(
 				url.searchParams.get("outputsize") ?? 10,
@@ -2148,6 +2163,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				intervalParam,
 				outputsize,
 				before,
+				rangeStart,
+				rangeEnd,
 			);
 
 			return json(
@@ -2603,6 +2620,8 @@ export class Chat extends DurableObject<LiveEnv> {
 		interval: RestInterval,
 		outputsize: number,
 		before: string | null,
+		rangeStart: string | null = null,
+		rangeEnd: string | null = null,
 	): Promise<HistoricalWorkerPayload> {
 		if (!this.env.TWELVEDATA_API_KEY) {
 			return {
@@ -2627,7 +2646,13 @@ export class Chat extends DurableObject<LiveEnv> {
 				this.env.TWELVEDATA_API_KEY,
 			);
 
-			if (before) {
+			if (rangeStart) {
+				upstream.searchParams.set("start_date", rangeStart);
+			}
+
+			if (rangeEnd) {
+				upstream.searchParams.set("end_date", rangeEnd);
+			} else if (before) {
 				upstream.searchParams.set("end_date", before);
 			}
 
@@ -2806,12 +2831,16 @@ export class Chat extends DurableObject<LiveEnv> {
 		interval: RestInterval,
 		outputsize: number,
 		before: string | null,
+		rangeStart: string | null = null,
+		rangeEnd: string | null = null,
 	) {
 		try {
 			const payload = await this.fetchHistoricalDirect(
 				interval,
 				outputsize,
 				before,
+				rangeStart,
+				rangeEnd,
 			);
 
 			if (
@@ -2933,6 +2962,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				symbol: SYMBOL,
 				interval,
 				requested_outputsize: outputsize,
+				requested_start_date: rangeStart,
+				requested_end_date: rangeEnd ?? before,
 				rows_received: payload.candles.length,
 				rows_considered_after_requested_limit: rowsToStore.length,
 				rows_validated: validRows.length,
@@ -4156,6 +4187,64 @@ export class Chat extends DurableObject<LiveEnv> {
 		if (this.autoState.last_30m_key == null) {
 			this.autoState.last_30m_key = scheduleBucketKey(cairoTime(Date.now()), 30);
 		}
+
+		// v16 migration-in-place: convert persisted v15.9 historical recovery
+		// queue items from backward end_date paging to exact start/end ranges.
+		for (const item of this.autoState.queue) {
+			if (
+				item.target_gap &&
+				(item.range_start ?? null) === null &&
+				(item.range_end ?? null) === null
+			) {
+				const sourceInterval = this.recoverySourceIntervalForGap(item.target_gap);
+				if (sourceInterval) {
+					const exactRange = this.recoveryExactRangeForGap(
+						sourceInterval,
+						item.target_gap,
+					);
+					item.before = null;
+					item.range_start = exactRange.start;
+					item.range_end = exactRange.end;
+				}
+			}
+		}
+	}
+
+	private autoQueuePriority(item: AutoQueueItem) {
+		if (item.reason.includes("bootstrap")) return 4;
+		if (item.target_gap) return 2;
+		if (item.reason.includes("backfill")) return 0;
+		return 1;
+	}
+
+	private sortAutoQueue() {
+		this.ensureAutoState();
+		const intervalPriority: RestInterval[] = [
+			"1min",
+			"5min",
+			"15min",
+			"30min",
+			"1h",
+			"1day",
+			"1week",
+			"1month",
+			"4h",
+		];
+		this.autoState!.queue.sort((a, b) => {
+			const classDelta = this.autoQueuePriority(a) - this.autoQueuePriority(b);
+			if (classDelta !== 0) return classDelta;
+			if (a.target_gap && b.target_gap) {
+				const recentDelta = b.target_gap.missing_from.localeCompare(
+					a.target_gap.missing_from,
+				);
+				if (recentDelta !== 0) return recentDelta;
+			}
+			const intervalDelta =
+				intervalPriority.indexOf(a.interval) -
+				intervalPriority.indexOf(b.interval);
+			if (intervalDelta !== 0) return intervalDelta;
+			return a.enqueued_ms - b.enqueued_ms;
+		});
 	}
 
 	private enqueueAutoIntervals(
@@ -4196,23 +4285,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			});
 		}
 
-		const priority: RestInterval[] = [
-			"1month",
-			"1week",
-			"1day",
-			"4h",
-			"1h",
-			"30min",
-			"15min",
-			"5min",
-			"1min",
-		];
-
-		state.queue.sort(
-			(a, b) =>
-				priority.indexOf(a.interval) -
-				priority.indexOf(b.interval),
-		);
+		this.sortAutoQueue();
 	}
 
 	private async ensureStorageMigration() {
@@ -4313,6 +4386,8 @@ export class Chat extends DurableObject<LiveEnv> {
 				outputsize: item.outputsize,
 				reason: item.reason,
 				before: item.before ?? null,
+				range_start: item.range_start ?? null,
+				range_end: item.range_end ?? null,
 				attempts: item.attempts,
 				target_gap: item.target_gap ?? null,
 			})),
@@ -4348,11 +4423,11 @@ export class Chat extends DurableObject<LiveEnv> {
 			},
 			cadence: {
 				"1min_rest": "every 5 minutes while market is open",
-				"5min_rest": "every 15 minutes while market is open",
-				"15min_rest": "every hour while market is open",
-				"30min_rest": "every hour while market is open",
-				"1h_rest": "every 4H close",
-				"4h_rest": "every 4H close",
+				"5min_rest": "every 5 minutes while market is open",
+				"15min_rest": "every 15 minutes while market is open",
+				"30min_rest": "every 30 minutes while market is open",
+				"1h_rest": "every hour while market is open",
+				"4h_rest": "not scheduled; confirmed 4H is derived locally from authoritative 1H",
 				"1day_rest": "after each trading-day close",
 				"1week_rest": "after Friday trading closes / Saturday 00:00 Cairo",
 				"1month_rest": "at the month boundary",
@@ -4711,12 +4786,15 @@ export class Chat extends DurableObject<LiveEnv> {
 			: gap.interval === "4h"
 				? "4h_source_backfill"
 				: "backfill";
+		const exactRange = this.recoveryExactRangeForGap(sourceInterval, gap);
 		return this.enqueueAutoRepair(
 			sourceInterval,
 			this.recoveryOutputsizeForSourceGap(sourceInterval, gap),
-			this.recoveryTargetEndDate(sourceInterval, gap),
+			null,
 			`${reasonPrefix}_${suffix}`,
 			gap,
+			exactRange.start,
+			exactRange.end,
 		);
 	}
 
@@ -4842,8 +4920,45 @@ export class Chat extends DurableObject<LiveEnv> {
 		return result;
 	}
 
-	private enqueuePendingActiveGapRecoveries() {
+	private async repairAllActiveDerivedGapsLocally() {
+		let attempted = 0;
+		let repaired = 0;
+		for (const interval of ["3min", "4h"] as const) {
+			const gaps = this.activeContinuityGaps(interval);
+			for (const gap of gaps) {
+				attempted++;
+				if (interval === "3min") {
+					await this.deriveThreeMinuteRangeFromOneMinute(
+						gap.missing_from,
+						gap.missing_to,
+					);
+				} else {
+					await this.deriveFourHourRangeFromOneHour(
+						gap.missing_from,
+						gap.missing_to,
+					);
+				}
+
+				const remaining = await this.verifyContinuityGap(gap);
+				if (!remaining) {
+					this.removeContinuityGap(gap);
+					repaired++;
+				} else if (
+					this.continuityGapKey(remaining) !== this.continuityGapKey(gap)
+				) {
+					this.removeContinuityGap(gap);
+					this.recordContinuityGap(remaining);
+				}
+			}
+		}
+		return { attempted, repaired };
+	}
+
+	private async enqueuePendingActiveGapRecoveries() {
 		this.ensureAutoState();
+		// Derived gaps are free to repair from already-stored source candles. Do
+		// that for every active 3M/4H gap before spending any Twelve Data credit.
+		await this.repairAllActiveDerivedGapsLocally();
 		const gaps = Object.values(this.autoState!.continuity_active_gaps ?? {})
 			.sort((a, b) => b.missing_from.localeCompare(a.missing_from));
 		let enqueued = 0;
@@ -5019,6 +5134,31 @@ export class Chat extends DurableObject<LiveEnv> {
 		);
 	}
 
+	private async trySyntheticFallbackForExactOneMinuteGap(
+		gap: ContinuityGap,
+	) {
+		if (
+			gap.interval !== "1min" ||
+			gap.missing_buckets < 1 ||
+			gap.missing_buckets > SYNTHETIC_MICRO_GAP_MAX_1M
+		) {
+			return { attempted: false, created: 0 };
+		}
+		const remaining = await this.verifyContinuityGap(gap);
+		if (!remaining) return { attempted: false, created: 0 };
+		const synthetic = await this.synthesizeSmallOneMinuteGapsInRange(
+			gap.before_datetime,
+			gap.after_datetime,
+		);
+		if (synthetic.created > 0) {
+			await this.deriveThreeMinuteRangeFromOneMinute(
+				gap.missing_from,
+				gap.missing_to,
+			);
+		}
+		return { attempted: true, created: synthetic.created };
+	}
+
 	private async syntheticApproximationReport() {
 		const page = await this.ctx.storage.list<NormalizedCandle>({
 			prefix: normalizedPrefix("1min"),
@@ -5040,34 +5180,60 @@ export class Chat extends DurableObject<LiveEnv> {
 		};
 	}
 
-	private recoveryTargetEndDate(
+	private recoveryExactRangeForGap(
 		sourceInterval: RecoveryInterval,
 		gap: ContinuityGap,
 	) {
-		// Twelve Data end_date behavior can be inclusive/exclusive around a
-		// missing bucket. Move the cursor a few SOURCE buckets past the first
-		// known candle after the gap so the returned page overlaps both sides.
+		// Exact historical recovery must ask the provider for the missing span
+		// itself. The old backward-page strategy could end after a session/weekend
+		// boundary and never reach an older gap. Derived gaps need enough source
+		// candles to cover the whole missing parent bucket (3M<-1M, 4H<-1H).
+		const sourceMinutes = this.continuityIntervalMinutes(sourceInterval);
+		const targetMinutes = this.continuityIntervalMinutes(
+			gap.interval as ContinuityTrackedInterval,
+		);
 		const overlapMinutes =
-			this.continuityIntervalMinutes(sourceInterval) *
-			RECOVERY_TARGET_OVERLAP_BUCKETS;
-		return addMinutesToCairoDatetime(gap.after_datetime, overlapMinutes);
+			sourceMinutes * TARGETED_REPAIR_OVERLAP_BUCKETS;
+		const sourceTailMinutes = Math.max(0, targetMinutes - sourceMinutes);
+		return {
+			start: addMinutesToCairoDatetime(
+				gap.missing_from,
+				-overlapMinutes,
+			),
+			end: addMinutesToCairoDatetime(
+				gap.missing_to,
+				sourceTailMinutes + overlapMinutes,
+			),
+		};
 	}
 
 	private recoveryNoopKey(
 		interval: RecoveryInterval,
 		before: string | null,
+		rangeStart: string | null = null,
+		rangeEnd: string | null = null,
 	) {
+		if (rangeStart || rangeEnd) {
+			return `${interval}|${rangeStart ?? "?"}|${rangeEnd ?? "?"}`;
+		}
 		return `${interval}|${before ?? "latest"}`;
 	}
 
 	private isRecoveryNoopCoolingDown(
 		interval: RecoveryInterval,
 		before: string | null,
+		rangeStart: string | null = null,
+		rangeEnd: string | null = null,
 	) {
 		this.ensureAutoState();
 		const until =
 			this.autoState!.recovery_noop_until_ms?.[
-				this.recoveryNoopKey(interval, before)
+				this.recoveryNoopKey(
+					interval,
+					before,
+					rangeStart,
+					rangeEnd,
+				)
 			] ?? 0;
 		return until > Date.now();
 	}
@@ -5109,24 +5275,36 @@ export class Chat extends DurableObject<LiveEnv> {
 		before: string | null,
 		reason: string,
 		targetGap: ContinuityGap | null = null,
+		rangeStart: string | null = null,
+		rangeEnd: string | null = null,
 	) {
 		this.ensureAutoState();
 		const state = this.autoState!;
 		if (
 			targetGap !== null &&
-			this.isRecoveryNoopCoolingDown(interval, before)
+			this.isRecoveryNoopCoolingDown(
+				interval,
+				before,
+				rangeStart,
+				rangeEnd,
+			)
 		) {
 			// Cooldown applies only to a specific exact gap that the provider could
 			// not fill. A stale authoritative tail must keep catching up normally.
 			return false;
 		}
 		const existing = state.queue.find(
-			(item) => item.interval === interval && (item.before ?? null) === before,
+			(item) =>
+				item.interval === interval &&
+				(item.before ?? null) === before &&
+				(item.range_start ?? null) === rangeStart &&
+				(item.range_end ?? null) === rangeEnd,
 		);
 		if (existing) {
 			existing.outputsize = Math.max(existing.outputsize, outputsize);
 			if (!existing.reason.includes(reason)) existing.reason += `|${reason}`;
 			if (targetGap) existing.target_gap = targetGap;
+			this.sortAutoQueue();
 			return true;
 		}
 		state.queue.push({
@@ -5136,8 +5314,11 @@ export class Chat extends DurableObject<LiveEnv> {
 			enqueued_ms: Date.now(),
 			attempts: 0,
 			before,
+			range_start: rangeStart,
+			range_end: rangeEnd,
 			target_gap: targetGap,
 		});
+		this.sortAutoQueue();
 		return true;
 	}
 
@@ -5165,28 +5346,43 @@ export class Chat extends DurableObject<LiveEnv> {
 			}
 		}
 
-		// 4H is derived from confirmed 1H. A missing closed 4H bucket can exist
-		// even when 1H Effective looks fresh because the newest hours are still
-		// provisional. In that case force a targeted 1H REST refresh ending at
-		// the next existing 4H bucket, then the normal post-refresh derivation
-		// rebuilds 4H from authoritative 1H history.
+		// 4H is derived from confirmed 1H. Treat a stale confirmed 4H tail as a
+		// blocker even when a provisional 4H view is current. First rebuild locally
+		// from authoritative 1H; only spend REST credits when the 1H source itself
+		// is stale or the exact historical source span is missing.
 		let fourHourAudit = await this.auditContinuity("4h", auditCache);
-		if (fourHourAudit.gap) {
+		if (fourHourAudit.gap || !fourHourAudit.authoritative_fresh) {
 			const oneHourAudit = await this.auditContinuity("1h", auditCache);
-			// First rebuild the derived 4H layer from already-authoritative 1H.
-			// Only spend a REST recovery request if the source itself cannot fix it.
-			if (oneHourAudit.gap === null && oneHourAudit.effective_fresh) {
-				await this.deriveFourHourRangeFromOneHour(
-					fourHourAudit.gap.missing_from,
-					fourHourAudit.gap.missing_to,
-				);
+			if (oneHourAudit.gap === null && oneHourAudit.authoritative_fresh) {
+				if (fourHourAudit.gap) {
+					await this.deriveFourHourRangeFromOneHour(
+						fourHourAudit.gap.missing_from,
+						fourHourAudit.gap.missing_to,
+					);
+				} else {
+					await this.deriveRecentFourHourFromOneHour();
+				}
 				auditCache.delete("4h");
 				fourHourAudit = await this.auditContinuity("4h", auditCache);
 			}
-			if (fourHourAudit.gap) {
+
+			if (fourHourAudit.gap && oneHourAudit.gap === null) {
 				this.enqueueRecoveryForContinuityGap(
 					fourHourAudit.gap,
 					"auto_recovery",
+				);
+			} else if (
+				!fourHourAudit.authoritative_fresh &&
+				!oneHourAudit.authoritative_fresh
+			) {
+				this.enqueueAutoRepair(
+					"1h",
+					this.recoveryOutputsizeForStaleness(
+						"1h",
+						oneHourAudit.latest_confirmed_datetime,
+					),
+					null,
+					"auto_recovery_4h_source_backfill",
 				);
 			}
 		}
@@ -5198,17 +5394,18 @@ export class Chat extends DurableObject<LiveEnv> {
 		// Queue every persisted exact gap on each audit. Exact-gap cooldowns are
 		// enforced inside enqueueAutoRepair(); the global 7/minute executor limit
 		// controls provider load while preventing an arbitrary 3-gap bottleneck.
-		this.enqueuePendingActiveGapRecoveries();
+		await this.enqueuePendingActiveGapRecoveries();
 	}
 
 
 	private auditHasBlockingProblem(audit: ContinuityAudit) {
-		if (audit.gap !== null || !audit.effective_fresh) return true;
-		// Native REST layers must be authoritative-fresh as well. Derived 3M/4H
-		// are validated through their effective/source continuity paths instead.
-		return (RECOVERY_INTERVALS as readonly string[]).includes(audit.interval)
-			? !audit.authoritative_fresh
-			: false;
+		// Provisional/effective data must never hide a stale confirmed layer. This
+		// applies to native REST timeframes and to the derived-confirmed 3M/4H layers.
+		return (
+			audit.gap !== null ||
+			!audit.effective_fresh ||
+			!audit.authoritative_fresh
+		);
 	}
 
 	private async ensureGoldDataReady() {
@@ -5249,13 +5446,13 @@ export class Chat extends DurableObject<LiveEnv> {
 			beforeAudits.push(threeMinuteBefore);
 			if (
 				threeMinuteBefore.gap !== null ||
-				!threeMinuteBefore.effective_fresh
+				!threeMinuteBefore.authoritative_fresh
 			) {
 				const oneMinuteBefore =
 					beforeAudits.find((audit) => audit.interval === "1min") ??
 					await this.auditContinuity("1min", auditCache);
 
-				if (oneMinuteBefore.gap === null && oneMinuteBefore.effective_fresh) {
+				if (oneMinuteBefore.gap === null && oneMinuteBefore.authoritative_fresh) {
 					if (threeMinuteBefore.gap) {
 						await this.deriveThreeMinuteRangeFromOneMinute(
 							threeMinuteBefore.gap.missing_from,
@@ -5268,52 +5465,67 @@ export class Chat extends DurableObject<LiveEnv> {
 					threeMinuteBefore = await this.auditContinuity("3min", auditCache);
 				}
 
-				if (
-					(threeMinuteBefore.gap !== null ||
-						!threeMinuteBefore.effective_fresh) &&
-					oneMinuteBefore.gap === null
+				if (threeMinuteBefore.gap && oneMinuteBefore.gap === null) {
+					this.enqueueRecoveryForContinuityGap(
+						threeMinuteBefore.gap,
+						"gpt_recovery",
+					);
+				} else if (
+					!threeMinuteBefore.authoritative_fresh &&
+					!oneMinuteBefore.authoritative_fresh
 				) {
-					if (threeMinuteBefore.gap) {
-						this.enqueueRecoveryForContinuityGap(
-							threeMinuteBefore.gap,
-							"gpt_recovery",
-						);
-					} else {
-						this.enqueueAutoRepair(
+					this.enqueueAutoRepair(
+						"1min",
+						this.recoveryOutputsizeForStaleness(
 							"1min",
-							this.recoveryOutputsizeForStaleness(
-								"1min",
-								oneMinuteBefore.latest_confirmed_datetime,
-							),
-							null,
-							"gpt_recovery_3m_source_backfill",
-						);
-					}
+							oneMinuteBefore.latest_confirmed_datetime,
+						),
+						null,
+						"gpt_recovery_3m_source_backfill",
+					);
 				}
 			}
 
-			// 4H is derived from confirmed 1H. If a closed 4H bucket is missing,
-			// force a targeted authoritative 1H refresh around that boundary.
+			// 4H is derived from confirmed 1H. A stale confirmed 4H tail is a blocker
+			// even when provisional 4H context is current. Rebuild locally first; if
+			// the authoritative 1H source is stale, catch that source up instead.
 			let fourHourBefore = await this.auditContinuity("4h", auditCache);
 			beforeAudits.push(fourHourBefore);
-			if (fourHourBefore.gap) {
+			if (fourHourBefore.gap || !fourHourBefore.authoritative_fresh) {
 				const oneHourBefore =
 					beforeAudits.find((audit) => audit.interval === "1h") ??
 					await this.auditContinuity("1h", auditCache);
 
-				if (oneHourBefore.gap === null && oneHourBefore.effective_fresh) {
-					await this.deriveFourHourRangeFromOneHour(
-						fourHourBefore.gap.missing_from,
-						fourHourBefore.gap.missing_to,
-					);
+				if (oneHourBefore.gap === null && oneHourBefore.authoritative_fresh) {
+					if (fourHourBefore.gap) {
+						await this.deriveFourHourRangeFromOneHour(
+							fourHourBefore.gap.missing_from,
+							fourHourBefore.gap.missing_to,
+						);
+					} else {
+						await this.deriveRecentFourHourFromOneHour();
+					}
 					auditCache.delete("4h");
 					fourHourBefore = await this.auditContinuity("4h", auditCache);
 				}
 
-				if (fourHourBefore.gap) {
+				if (fourHourBefore.gap && oneHourBefore.gap === null) {
 					this.enqueueRecoveryForContinuityGap(
 						fourHourBefore.gap,
 						"gpt_recovery",
+					);
+				} else if (
+					!fourHourBefore.authoritative_fresh &&
+					!oneHourBefore.authoritative_fresh
+				) {
+					this.enqueueAutoRepair(
+						"1h",
+						this.recoveryOutputsizeForStaleness(
+							"1h",
+							oneHourBefore.latest_confirmed_datetime,
+						),
+						null,
+						"gpt_recovery_4h_source_backfill",
 					);
 				}
 			}
@@ -5534,14 +5746,10 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 
 		if (fourKey !== state.last_4h_key) {
+			// Confirmed 4H is a local derived layer from authoritative 1H. The hourly
+			// REST refresh above already triggers deriveRecentFourHourFromOneHour(),
+			// so a separate Twelve Data 4H request would only consume rate budget.
 			state.last_4h_key = fourKey;
-			if (!marketClosed) {
-				this.enqueueAutoIntervals(
-					["4h"],
-					AUTO_INCREMENTAL_OUTPUTSIZE,
-					"4h_close",
-				);
-			}
 		}
 
 		if (currentDateKey !== state.last_day_key) {
@@ -5556,7 +5764,7 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			if (previousDay && isTradingDayCairo(previousDay)) {
 				this.enqueueAutoIntervals(
-					["1day", "4h", "1h", "30min", "15min", "5min", "1min"],
+					["1day", "1h", "30min", "15min", "5min", "1min"],
 					AUTO_INCREMENTAL_OUTPUTSIZE,
 					"day_close",
 				);
@@ -5569,7 +5777,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			if (state.last_week_close_key !== weeklyKey) {
 				state.last_week_close_key = weeklyKey;
 				this.enqueueAutoIntervals(
-					["1week", "1day", "4h", "1h", "30min", "15min", "5min", "1min"],
+					["1week", "1day", "1h", "30min", "15min", "5min", "1min"],
 					AUTO_INCREMENTAL_OUTPUTSIZE,
 					"week_close",
 				);
@@ -5579,7 +5787,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		if (currentMonthKey !== state.last_month_key) {
 			state.last_month_key = currentMonthKey;
 			this.enqueueAutoIntervals(
-				["1month", "1week", "1day", "4h", "1h", "30min", "15min", "5min", "1min"],
+				["1month", "1week", "1day", "1h", "30min", "15min", "5min", "1min"],
 				AUTO_INCREMENTAL_OUTPUTSIZE,
 				"month_close",
 			);
@@ -5699,14 +5907,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		if (item.reason.includes("3m_source_backfill")) auditInterval = "3min";
 		if (item.reason.includes("4h_source_backfill")) auditInterval = "4h";
 		const audit = await this.auditContinuity(auditInterval);
-		if (!audit.gap) return false;
-		const sourceInterval = this.recoverySourceIntervalForGap(audit.gap);
-		if (!sourceInterval) return false;
-		const expectedCursor = this.recoveryTargetEndDate(
-			sourceInterval,
-			audit.gap,
-		);
-		return (item.before ?? null) === expectedCursor;
+		return this.auditHasBlockingProblem(audit);
 	}
 
 	private async processAutoQueue() {
@@ -5771,11 +5972,18 @@ export class Chat extends DurableObject<LiveEnv> {
 				item.interval,
 				item.outputsize,
 				item.before ?? null,
+				item.range_start ?? null,
+				item.range_end ?? null,
 			);
 
 			if (result.status === "ok") {
 				try {
 					await this.postAutoRefresh(item, result);
+					if (item.target_gap?.interval === "1min") {
+						await this.trySyntheticFallbackForExactOneMinuteGap(
+							item.target_gap,
+						);
+					}
 					state.last_success_ms = Date.now();
 					state.last_error = null;
 
@@ -5784,14 +5992,13 @@ export class Chat extends DurableObject<LiveEnv> {
 						const key = this.recoveryNoopKey(
 							item.interval as RecoveryInterval,
 							item.before ?? null,
+							item.range_start ?? null,
+							item.range_end ?? null,
 						);
 						if (item.target_gap) {
-							const rowsWritten = Number(
-								(result as { rows_written?: number }).rows_written ?? 0,
-							);
 							const sameGapStillPresent =
 								await this.recoveryGapStillPresentForItem(item);
-							if (rowsWritten === 0 || sameGapStillPresent) {
+							if (sameGapStillPresent) {
 								state.recovery_noop_until_ms[key] =
 									Date.now() + RECOVERY_NOOP_COOLDOWN_MS;
 							} else {
