@@ -4,7 +4,7 @@ import { handleGoldMcpRequest } from "./mcp";
 const SYMBOL = "XAU/USD";
 const TIMEZONE = "Africa/Cairo";
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v16.1-credit-safe-self-heal-2026-09-25";
+const BUILD_VERSION = "v16.2-multi-key-failover-2026-10-01";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -37,16 +37,19 @@ const AUTO_RATE_WINDOW_MS = 60_000;
 // for a manual request and process the rest automatically on the next alarm.
 const AUTO_MAX_REQUESTS_PER_WINDOW = 7;
 
-// Twelve Data Basic daily-credit safety. Keep a hard reserve so the provider
-// account never gets intentionally driven to its 800-credit ceiling by this
-// Worker. Old historical gaps pause first; current authoritative catch-up keeps
-// a larger allowance. Manual /historical requests still stop before the final
-// reserve. The counter is conservative: every attempted REST request counts.
-const TWELVE_DAILY_CREDIT_LIMIT = 800;
-const TWELVE_HISTORICAL_AUTO_CEILING = 540;
-const TWELVE_CURRENT_AUTO_CEILING = 650;
-const TWELVE_MANUAL_HARD_CEILING = 700;
+// v16.2 multi-key failover. REST no longer stops at fixed 540/650/700 ceilings.
+// The Worker consumes the currently active Twelve Data key until the provider
+// reports that key exhausted, then immediately rotates to the next configured key.
+// Existing TWELVEDATA_API_KEY remains key_1; add TWELVEDATA_API_KEY_2,
+// TWELVEDATA_API_KEY_3, ... as encrypted Worker secrets. Numbered bindings are
+// discovered dynamically; the fallback scan covers the first 100 slots even if
+// a runtime does not enumerate secret bindings.
+const TWELVE_DEFAULT_MINUTE_CREDIT_LIMIT = 8;
+const TWELVE_BASIC_DAILY_LIMIT_REFERENCE = 800;
+const TWELVE_NUMBERED_KEY_FALLBACK_SCAN = 100;
 const TWELVE_CREDIT_RESET_BUFFER_MS = 2 * 60_000;
+const TWELVE_MINUTE_RESET_BUFFER_MS = 1_500;
+const TWELVE_INVALID_KEY_RETRY_MS = 5 * 60_000;
 const TWELVE_RECENT_GAP_WINDOW_MS = 6 * 60 * 60_000;
 
 const AUTO_INCREMENTAL_OUTPUTSIZE = 12;
@@ -114,6 +117,26 @@ const REST_INTERVALS = [
 
 type RestInterval = (typeof REST_INTERVALS)[number];
 type TwelveCreditClass = "manual" | "auto_current" | "auto_historical";
+
+type TwelveApiKeyBinding = {
+	slot: number;
+	id: string;
+	secret_name: string;
+	api_key: string;
+};
+
+type TwelveKeyRuntimeState = {
+	utc_day: string;
+	attempts: number;
+	minute_credits_used: number | null;
+	minute_credits_left: number | null;
+	minute_credit_limit: number | null;
+	blocked_until_ms: number | null;
+	block_reason: "daily_quota" | "rate_limit" | "invalid_key" | null;
+	last_error: string | null;
+	last_success_ms: number | null;
+	last_response_ms: number | null;
+};
 
 const BOOTSTRAP_OUTPUTSIZE_BY_INTERVAL: Record<RestInterval, number> = {
 	"1min": 1150,
@@ -385,13 +408,14 @@ type AutoRefreshState = {
 	continuity_deep_before?: Partial<Record<ContinuityTrackedInterval, string | null>>;
 	continuity_deep_rotation_index?: number;
 	continuity_active_gaps?: Record<string, ContinuityGap>;
-	// Conservative Twelve Data daily-credit accounting. This tracks requests made
-	// by this Worker only; it deliberately reserves at least 100 credits below the
-	// provider's 800-credit Basic-plan ceiling.
+	// v16.2 Twelve Data multi-key pool. Legacy aggregate fields are retained for
+	// migration/observability only; they no longer impose fixed credit ceilings.
 	twelve_credit_utc_day?: string;
 	twelve_credit_attempts?: number;
 	twelve_quota_block_until_ms?: number | null;
 	twelve_quota_last_error?: string | null;
+	twelve_key_states?: Record<string, TwelveKeyRuntimeState>;
+	twelve_active_key_slot?: number | null;
 };
 
 type RecoveryBudgetState = {
@@ -416,6 +440,11 @@ type HistoricalWorkerPayload = {
 	next_before?: string | null;
 	columns?: string[];
 	candles?: unknown[][];
+	provider_key?: string;
+	provider_secret_name?: string;
+	provider_minute_credits_used?: number | null;
+	provider_minute_credits_left?: number | null;
+	provider_minute_credit_limit?: number | null;
 	error?: unknown;
 };
 
@@ -440,8 +469,12 @@ type TwelveDataResponse = {
 };
 
 type LiveEnv = {
-	TWELVEDATA_API_KEY: string;
+	// Existing production secret. Kept as key_1 for backwards compatibility.
+	TWELVEDATA_API_KEY?: string;
+	// Optional explicit key_1 alias plus dynamically discovered _2, _3, ... keys.
+	TWELVEDATA_API_KEY_1?: string;
 	Chat: DurableObjectNamespace;
+	[key: string]: unknown;
 };
 
 type ProvisionalCandle = {
@@ -836,6 +869,7 @@ export class Chat extends DurableObject<LiveEnv> {
 	private historicalStorageWriteError: string | null = null;
 	private subscribeStatus: unknown = null;
 	private autoState: AutoRefreshState | null = null;
+	private twelveApiKeysCache: TwelveApiKeyBinding[] | null = null;
 
 	// v15.8 lazy-storage lifecycle state. None of these fields are persisted;
 	// they exist only to stop repeated quota reads inside one runtime instance.
@@ -2284,6 +2318,56 @@ export class Chat extends DurableObject<LiveEnv> {
 		});
 	}
 
+	private twelveDataApiKeys(): TwelveApiKeyBinding[] {
+		if (this.twelveApiKeysCache !== null) return this.twelveApiKeysCache;
+		const bySlot = new Map<number, TwelveApiKeyBinding>();
+		const add = (slot: number, secretName: string, value: unknown) => {
+			if (!Number.isInteger(slot) || slot < 1) return;
+			if (typeof value !== "string" || value.trim().length === 0) return;
+			// Existing TWELVEDATA_API_KEY always wins slot 1 so deployments remain
+			// backwards compatible. For all other slots the first discovered binding wins.
+			if (bySlot.has(slot)) return;
+			bySlot.set(slot, {
+				slot,
+				id: `key_${slot}`,
+				secret_name: secretName,
+				api_key: value.trim(),
+			});
+		};
+
+		add(1, "TWELVEDATA_API_KEY", this.env.TWELVEDATA_API_KEY);
+		if (!bySlot.has(1)) {
+			add(1, "TWELVEDATA_API_KEY_1", this.env.TWELVEDATA_API_KEY_1);
+		}
+
+		// Discover any numbered secret exposed by the Worker runtime. This means
+		// TWELVEDATA_API_KEY_2, _3, _4 ... do not require code changes.
+		for (const [name, value] of Object.entries(this.env)) {
+			const match = /^TWELVEDATA_API_KEY_(\d+)$/.exec(name);
+			if (!match) continue;
+			add(Number(match[1]), name, value);
+		}
+
+		// Defensive fallback for runtimes/tooling that do not enumerate secrets.
+		for (let slot = 2; slot <= TWELVE_NUMBERED_KEY_FALLBACK_SCAN; slot++) {
+			const name = `TWELVEDATA_API_KEY_${slot}`;
+			add(slot, name, this.env[name]);
+		}
+
+		const ordered = Array.from(bySlot.values()).sort((a, b) => a.slot - b.slot);
+		const seenSecrets = new Set<string>();
+		this.twelveApiKeysCache = ordered.filter((entry) => {
+			if (seenSecrets.has(entry.api_key)) return false;
+			seenSecrets.add(entry.api_key);
+			return true;
+		});
+		return this.twelveApiKeysCache;
+	}
+
+	private primaryTwelveDataApiKey() {
+		return this.twelveDataApiKeys()[0] ?? null;
+	}
+
 	private async ensureConnection() {
 		if (!this.enabled) return;
 
@@ -2303,9 +2387,10 @@ export class Chat extends DurableObject<LiveEnv> {
 	private async connect() {
 		if (!this.enabled) return;
 
-		if (!this.env.TWELVEDATA_API_KEY) {
+		const websocketKey = this.primaryTwelveDataApiKey();
+		if (!websocketKey) {
 			this.connectionStatus = "error";
-			this.lastError = "TWELVEDATA_API_KEY is missing";
+			this.lastError = "No Twelve Data API key is configured";
 
 			await this.persist();
 			return;
@@ -2317,7 +2402,7 @@ export class Chat extends DurableObject<LiveEnv> {
 		const endpoint =
 			"wss://ws.twelvedata.com/v1/quotes/price" +
 			"?apikey=" +
-			encodeURIComponent(this.env.TWELVEDATA_API_KEY);
+			encodeURIComponent(websocketKey.api_key);
 
 		try {
 			const socket = new WebSocket(endpoint);
@@ -2656,92 +2741,154 @@ export class Chat extends DurableObject<LiveEnv> {
 		rangeEnd: string | null = null,
 		creditClass: TwelveCreditClass = "manual",
 	): Promise<HistoricalWorkerPayload> {
-		if (!this.env.TWELVEDATA_API_KEY) {
+		const configuredKeys = this.twelveDataApiKeys();
+		if (configuredKeys.length === 0) {
 			return {
 				status: "error",
 				interval,
-				error: "TWELVEDATA_API_KEY is missing",
+				error:
+					"No Twelve Data API key is configured. Keep TWELVEDATA_API_KEY as key_1 and add TWELVEDATA_API_KEY_2, _3, ... as Worker secrets.",
 			};
 		}
 
-		try {
-			const creditGuard = this.twelveCreditGuard(creditClass);
-			if (!creditGuard.allowed) {
+		this.ensureAutoState();
+		this.refreshTwelveCreditDay();
+
+		const candidateKeys = this.availableTwelveDataKeys();
+		if (candidateKeys.length === 0) {
+			const retryAt = this.nextTwelvePoolRetryMs();
+			return {
+				status: "error",
+				interval,
+				error:
+					`TWELVE_KEY_POOL_EXHAUSTED: all ${configuredKeys.length} configured key(s) are blocked/exhausted` +
+					(retryAt ? ` until ${new Date(retryAt).toISOString()}` : ""),
+			};
+		}
+
+		const attempted: string[] = [];
+		let lastKeyError: string | null = null;
+
+		for (const key of candidateKeys) {
+			const attemptNow = Date.now();
+			if (!this.claimTwelveAutoRateAttempt(creditClass, attemptNow)) {
 				return {
 					status: "error",
 					interval,
-					error: `TWELVE_CREDIT_GUARD:${creditGuard.reason}: used=${creditGuard.used}, ceiling=${creditGuard.ceiling}`,
+					error: "TWELVE_RATE_WINDOW_WAIT: automatic REST rate window is full; retry on the next alarm",
 				};
 			}
 
-			this.recordTwelveCreditAttempt();
-			// Manual direct calls are not followed by processAutoQueue(), so persist the
-			// conservative counter here. Automatic batches persist once after processing.
-			if (creditClass === "manual") {
-				await this.persistAutoState();
-			}
+			this.recordTwelveCreditAttempt(key, attemptNow);
+			attempted.push(key.id);
 
 			const upstream = new URL(TWELVE_DATA_REST_URL);
-
 			upstream.searchParams.set("symbol", SYMBOL);
 			upstream.searchParams.set("interval", interval);
-			upstream.searchParams.set(
-				"outputsize",
-				String(outputsize),
-			);
+			upstream.searchParams.set("outputsize", String(outputsize));
 			upstream.searchParams.set("timezone", TIMEZONE);
-			upstream.searchParams.set(
-				"apikey",
-				this.env.TWELVEDATA_API_KEY,
-			);
+			upstream.searchParams.set("apikey", key.api_key);
 
 			if (rangeStart) {
 				upstream.searchParams.set("start_date", rangeStart);
 			}
-
 			if (rangeEnd) {
 				upstream.searchParams.set("end_date", rangeEnd);
 			} else if (before) {
 				upstream.searchParams.set("end_date", before);
 			}
 
-			const response = await fetch(upstream.toString(), {
-				headers: {
-					Accept: "application/json",
-				},
-			});
+			let response: Response;
+			let payload: TwelveDataResponse;
+			try {
+				response = await fetch(upstream.toString(), {
+					headers: { Accept: "application/json" },
+				});
+				try {
+					payload = (await response.json()) as TwelveDataResponse;
+				} catch {
+					payload = {
+						status: "error",
+						message: `Twelve Data returned non-JSON HTTP ${response.status}`,
+					};
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				lastKeyError = `${key.id}: ${message}`;
+				const keyState = this.autoState?.twelve_key_states?.[key.id];
+				if (keyState) {
+					keyState.last_error = message;
+					keyState.last_response_ms = Date.now();
+				}
+				if (creditClass === "manual") await this.persistAutoState();
+				// A transport failure hits the same Twelve Data host for every key, so
+				// rotating keys would only multiply traffic without improving availability.
+				return {
+					status: "error",
+					interval,
+					provider_key: key.id,
+					provider_secret_name: key.secret_name,
+					error: message,
+				};
+			}
 
-			const payload =
-				(await response.json()) as TwelveDataResponse;
+			const responseNow = Date.now();
+			this.applyTwelveCreditHeaders(key, response.headers, responseNow);
+			const keyState = this.autoState?.twelve_key_states?.[key.id] ?? null;
+			const providerError =
+				payload.message ??
+				(!response.ok ? `Twelve Data HTTP ${response.status}` : "Twelve Data returned an invalid payload");
 
 			if (
 				!response.ok ||
 				payload.status === "error" ||
 				!Array.isArray(payload.values)
 			) {
-				const providerError =
-					payload.message ?? "Twelve Data returned an invalid payload";
+				lastKeyError = `${key.id}: ${providerError}`;
+
 				if (this.isTwelveDailyCreditError(providerError)) {
-					this.noteTwelveQuotaFailure(providerError);
-					await this.persistAutoState();
+					this.markTwelveKeyQuotaFailure(key, providerError, responseNow);
+					continue;
 				}
+				if (this.isTwelveRateLimitError(response.status, providerError)) {
+					this.markTwelveKeyRateLimit(key, providerError, responseNow);
+					continue;
+				}
+				if (this.isTwelveApiKeyError(response.status, providerError)) {
+					this.markTwelveKeyInvalid(key, providerError, responseNow);
+					continue;
+				}
+
+				if (creditClass === "manual") await this.persistAutoState();
 				return {
 					status: "error",
 					interval,
+					provider_key: key.id,
+					provider_secret_name: key.secret_name,
+					provider_minute_credits_used: keyState?.minute_credits_used ?? null,
+					provider_minute_credits_left: keyState?.minute_credits_left ?? null,
+					provider_minute_credit_limit: keyState?.minute_credit_limit ?? null,
 					error: providerError,
 				};
 			}
 
 			const returnedInterval = payload.meta?.interval;
-
 			if (returnedInterval !== interval) {
+				if (creditClass === "manual") await this.persistAutoState();
 				return {
 					status: "error",
 					interval,
 					requested_size: outputsize,
+					provider_key: key.id,
+					provider_secret_name: key.secret_name,
 					error:
 						`Interval mismatch: requested ${interval}, returned ${returnedInterval ?? "unknown"}`,
 				};
+			}
+
+			this.markTwelveKeySuccess(key, responseNow);
+			if (this.autoState) {
+				this.autoState.last_error = null;
 			}
 
 			const candles: unknown[][] = payload.values
@@ -2754,17 +2901,13 @@ export class Chat extends DurableObject<LiveEnv> {
 				])
 				.filter((row) => Boolean(row[0]));
 
-			const datetimes = candles
-				.map((row) => String(row[0]))
-				.sort();
-
-			const oldest =
-				datetimes.length > 0 ? datetimes[0] : undefined;
+			const datetimes = candles.map((row) => String(row[0])).sort();
+			const oldest = datetimes.length > 0 ? datetimes[0] : undefined;
 			const newest =
-				datetimes.length > 0
-					? datetimes[datetimes.length - 1]
-					: undefined;
+				datetimes.length > 0 ? datetimes[datetimes.length - 1] : undefined;
 
+			if (creditClass === "manual") await this.persistAutoState();
+			const finalKeyState = this.autoState?.twelve_key_states?.[key.id] ?? null;
 			return {
 				status: "ok",
 				symbol: payload.meta?.symbol ?? SYMBOL,
@@ -2774,25 +2917,28 @@ export class Chat extends DurableObject<LiveEnv> {
 				newest,
 				oldest,
 				next_before: oldest ?? null,
-				columns: [
-					"datetime",
-					"open",
-					"high",
-					"low",
-					"close",
-				],
+				columns: ["datetime", "open", "high", "low", "close"],
 				candles,
-			};
-		} catch (error) {
-			return {
-				status: "error",
-				interval,
-				error:
-					error instanceof Error
-						? error.message
-						: String(error),
+				provider_key: key.id,
+				provider_secret_name: key.secret_name,
+				provider_minute_credits_used: finalKeyState?.minute_credits_used ?? null,
+				provider_minute_credits_left: finalKeyState?.minute_credits_left ?? null,
+				provider_minute_credit_limit: finalKeyState?.minute_credit_limit ?? null,
 			};
 		}
+
+		const retryAt = this.nextTwelvePoolRetryMs();
+		const message =
+			`TWELVE_KEY_POOL_EXHAUSTED: tried ${attempted.join(", ") || "no available key"}` +
+			(lastKeyError ? `; last_error=${lastKeyError}` : "") +
+			(retryAt ? `; retry_at=${new Date(retryAt).toISOString()}` : "");
+		if (this.autoState) this.autoState.last_error = message;
+		if (creditClass === "manual") await this.persistAutoState();
+		return {
+			status: "error",
+			interval,
+			error: message,
+		};
 	}
 
 	private async purgeHistoricalInterval(
@@ -4231,6 +4377,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			twelve_credit_attempts: 0,
 			twelve_quota_block_until_ms: null,
 			twelve_quota_last_error: null,
+			twelve_key_states: {},
+			twelve_active_key_slot: this.twelveDataApiKeys()[0]?.slot ?? null,
 		};
 	}
 
@@ -4256,14 +4404,9 @@ export class Chat extends DurableObject<LiveEnv> {
 		if (this.autoState.last_2h_key == null) {
 			this.autoState.last_2h_key = twoHourScheduleKey(cairoTime(Date.now()));
 		}
+		// v16.2 migration-in-place initializes the per-key pool and moves any
+		// legacy v16.1 quota block onto key_1 only, leaving newer keys available.
 		this.refreshTwelveCreditDay();
-		if (
-			this.isTwelveDailyCreditError(this.autoState.last_error) &&
-			!(this.autoState.twelve_quota_block_until_ms &&
-				this.autoState.twelve_quota_block_until_ms > Date.now())
-		) {
-			this.noteTwelveQuotaFailure(this.autoState.last_error);
-		}
 
 		// v16 migration-in-place: convert persisted v15.9 historical recovery
 		// queue items from backward end_date paging to exact start/end ranges.
@@ -4290,9 +4433,28 @@ export class Chat extends DurableObject<LiveEnv> {
 	private isTwelveDailyCreditError(value: unknown) {
 		if (value == null) return false;
 		const message = value instanceof Error ? value.message : String(value);
-		return /(?:run out of API credits|API credits were used|daily.*credit|credit.*limit being|current limit being 800)/i.test(
+		return /(?:run out of API credits|API credits were used|daily.*credit|daily.*quota|credit.*limit being|quota.*exhausted|credits.*exhausted)/i.test(
 			message,
 		);
+	}
+
+	private isTwelveRateLimitError(status: number, value: unknown) {
+		if (status !== 429) return false;
+		if (this.isTwelveDailyCreditError(value)) return false;
+		const message = value == null ? "" : String(value);
+		return /(?:rate|minute|minutely|too many requests|429|limit)/i.test(message) || status === 429;
+	}
+
+	private isTwelveApiKeyError(status: number, value: unknown) {
+		if (status === 401 || status === 403) return true;
+		const message = value == null ? "" : String(value);
+		return /(?:invalid|missing|incorrect|unauthorized).*(?:api.?key|apikey)|(?:api.?key|apikey).*(?:invalid|missing|incorrect|unauthorized)/i.test(
+			message,
+		);
+	}
+
+	private nextTwelveMinuteResetMs(now = Date.now()) {
+		return Math.floor(now / 60_000) * 60_000 + 60_000 + TWELVE_MINUTE_RESET_BUFFER_MS;
 	}
 
 	private nextTwelveCreditResetMs(now = Date.now()) {
@@ -4312,34 +4474,150 @@ export class Chat extends DurableObject<LiveEnv> {
 		const state = this.autoState;
 		if (!state) return;
 		const utcDay = new Date(now).toISOString().slice(0, 10);
-		if (state.twelve_credit_utc_day == null) {
-			// Migration from v16.0: initialize the counter for the current provider day
-			// without erasing an already-observed quota error from that same day.
-			state.twelve_credit_utc_day = utcDay;
-			state.twelve_credit_attempts ??= 0;
-		} else if (state.twelve_credit_utc_day !== utcDay) {
+		const keys = this.twelveDataApiKeys();
+		const hadPoolState = state.twelve_key_states != null;
+		const previousUtcDay = state.twelve_credit_utc_day ?? null;
+
+		state.twelve_key_states ??= {};
+		state.twelve_credit_attempts ??= 0;
+
+		if (previousUtcDay !== utcDay) {
 			state.twelve_credit_utc_day = utcDay;
 			state.twelve_credit_attempts = 0;
+			state.twelve_active_key_slot = keys[0]?.slot ?? null;
+			state.twelve_quota_block_until_ms = null;
+			state.twelve_quota_last_error = null;
+			if (this.isTwelveDailyCreditError(state.last_error)) {
+				state.last_error = null;
+			}
+		} else if (state.twelve_credit_utc_day == null) {
+			state.twelve_credit_utc_day = utcDay;
+		}
+
+		for (const key of keys) {
+			let keyState = state.twelve_key_states[key.id];
+			if (!keyState || keyState.utc_day !== utcDay) {
+				keyState = {
+					utc_day: utcDay,
+					attempts: 0,
+					minute_credits_used: null,
+					minute_credits_left: null,
+					minute_credit_limit: null,
+					blocked_until_ms: null,
+					block_reason: null,
+					last_error: null,
+					last_success_ms: null,
+					last_response_ms: null,
+				};
+				state.twelve_key_states[key.id] = keyState;
+			}
+		}
+
+		// v16.1 -> v16.2 migration: move the old global counter/block onto key_1
+		// only. Other configured keys stay immediately available.
+		if (!hadPoolState && keys.length > 0 && previousUtcDay === utcDay) {
+			const primaryState = state.twelve_key_states[keys[0].id];
+			if (primaryState) {
+				primaryState.attempts = Math.max(
+					primaryState.attempts,
+					state.twelve_credit_attempts ?? 0,
+				);
+				if (
+					state.twelve_quota_block_until_ms != null &&
+					state.twelve_quota_block_until_ms > now
+				) {
+					primaryState.blocked_until_ms = state.twelve_quota_block_until_ms;
+					primaryState.block_reason = "daily_quota";
+					primaryState.last_error = state.twelve_quota_last_error ?? state.last_error;
+				}
+			}
 			state.twelve_quota_block_until_ms = null;
 			state.twelve_quota_last_error = null;
 			if (this.isTwelveDailyCreditError(state.last_error)) {
 				state.last_error = null;
 			}
 		}
-		state.twelve_credit_attempts ??= 0;
-		state.twelve_quota_block_until_ms ??= null;
-		state.twelve_quota_last_error ??= null;
+
+		for (const key of keys) {
+			const keyState = state.twelve_key_states[key.id];
+			if (!keyState) continue;
+			if (
+				keyState.last_response_ms != null &&
+				Math.floor(keyState.last_response_ms / 60_000) !== Math.floor(now / 60_000)
+			) {
+				keyState.minute_credits_used = null;
+				keyState.minute_credits_left = null;
+				keyState.minute_credit_limit = null;
+			}
+			if (
+				keyState.blocked_until_ms != null &&
+				keyState.blocked_until_ms <= now &&
+				keyState.block_reason !== "daily_quota"
+			) {
+				const wasRateLimited = keyState.block_reason === "rate_limit";
+				keyState.blocked_until_ms = null;
+				keyState.block_reason = null;
+				keyState.last_error = null;
+				if (wasRateLimited) {
+					keyState.minute_credits_used = null;
+					keyState.minute_credits_left = null;
+					keyState.minute_credit_limit = null;
+				}
+			}
+		}
+
+		const configuredSlots = new Set(keys.map((key) => key.slot));
+		if (
+			state.twelve_active_key_slot == null ||
+			!configuredSlots.has(state.twelve_active_key_slot)
+		) {
+			state.twelve_active_key_slot = keys[0]?.slot ?? null;
+		}
 	}
 
-	private noteTwelveQuotaFailure(error: unknown) {
-		if (!this.autoState) return null;
-		this.refreshTwelveCreditDay();
-		const message = error instanceof Error ? error.message : String(error);
-		const retryAt = this.nextTwelveCreditResetMs();
-		this.autoState.twelve_quota_block_until_ms = retryAt;
-		this.autoState.twelve_quota_last_error = message;
-		this.autoState.last_error = message;
-		return retryAt;
+	private twelveKeyState(key: TwelveApiKeyBinding, now = Date.now()) {
+		this.refreshTwelveCreditDay(now);
+		const state = this.autoState;
+		if (!state) return null;
+		return state.twelve_key_states?.[key.id] ?? null;
+	}
+
+	private isTwelveKeyAvailable(key: TwelveApiKeyBinding, now = Date.now()) {
+		const keyState = this.twelveKeyState(key, now);
+		if (!keyState) return true;
+		if (keyState.blocked_until_ms != null && keyState.blocked_until_ms > now) {
+			return false;
+		}
+		return true;
+	}
+
+	private orderedTwelveDataKeys(now = Date.now()) {
+		this.refreshTwelveCreditDay(now);
+		const keys = this.twelveDataApiKeys();
+		if (keys.length <= 1) return keys;
+		const activeSlot = this.autoState?.twelve_active_key_slot ?? keys[0].slot;
+		const activeIndex = Math.max(
+			0,
+			keys.findIndex((key) => key.slot === activeSlot),
+		);
+		return [...keys.slice(activeIndex), ...keys.slice(0, activeIndex)];
+	}
+
+	private availableTwelveDataKeys(now = Date.now()) {
+		return this.orderedTwelveDataKeys(now).filter((key) =>
+			this.isTwelveKeyAvailable(key, now),
+		);
+	}
+
+	private nextTwelvePoolRetryMs(now = Date.now()) {
+		this.refreshTwelveCreditDay(now);
+		const keys = this.twelveDataApiKeys();
+		if (keys.length === 0) return null;
+		const retries = keys
+			.map((key) => this.twelveKeyState(key, now)?.blocked_until_ms ?? null)
+			.filter((value): value is number => value != null && value > now);
+		if (retries.length === 0) return this.nextTwelveCreditResetMs(now);
+		return Math.min(...retries);
 	}
 
 	private isOldHistoricalRecovery(item: AutoQueueItem, now = Date.now()) {
@@ -4355,58 +4633,155 @@ export class Chat extends DurableObject<LiveEnv> {
 			: "auto_current";
 	}
 
-	private twelveCreditCeiling(creditClass: TwelveCreditClass) {
-		if (creditClass === "auto_historical") return TWELVE_HISTORICAL_AUTO_CEILING;
-		if (creditClass === "auto_current") return TWELVE_CURRENT_AUTO_CEILING;
-		return TWELVE_MANUAL_HARD_CEILING;
-	}
-
-	private twelveCreditGuard(creditClass: TwelveCreditClass, now = Date.now()) {
+	private twelveCreditGuard(_creditClass: TwelveCreditClass, now = Date.now()) {
 		this.ensureAutoState();
 		this.refreshTwelveCreditDay(now);
-		const state = this.autoState!;
-		const used = state.twelve_credit_attempts ?? 0;
-		const blockedUntil = state.twelve_quota_block_until_ms ?? null;
-		const ceiling = this.twelveCreditCeiling(creditClass);
-
-		if (blockedUntil !== null && blockedUntil > now) {
-			return {
-				allowed: false,
-				reason: "provider_daily_quota_block",
-				used,
-				ceiling,
-				retry_at_ms: blockedUntil,
-			};
-		}
-
-		if (used >= ceiling) {
-			return {
-				allowed: false,
-				reason: creditClass === "auto_historical"
-					? "historical_credit_reserve"
-					: creditClass === "auto_current"
-						? "automatic_credit_reserve"
-						: "manual_credit_reserve",
-				used,
-				ceiling,
-				retry_at_ms: this.nextTwelveCreditResetMs(now),
-			};
-		}
-
+		const configured = this.twelveDataApiKeys();
+		const available = this.availableTwelveDataKeys(now);
 		return {
-			allowed: true,
-			reason: null,
-			used,
-			ceiling,
-			retry_at_ms: null,
+			allowed: available.length > 0,
+			reason:
+				configured.length === 0
+					? "no_api_keys_configured"
+					: available.length === 0
+						? "all_api_keys_temporarily_or_daily_blocked"
+						: null,
+			used: this.autoState?.twelve_credit_attempts ?? 0,
+			ceiling: null as number | null,
+			retry_at_ms:
+				available.length > 0 ? null : this.nextTwelvePoolRetryMs(now),
 		};
 	}
 
-	private recordTwelveCreditAttempt() {
+	private claimTwelveAutoRateAttempt(creditClass: TwelveCreditClass, now = Date.now()) {
+		if (creditClass === "manual") return true;
 		this.ensureAutoState();
-		this.refreshTwelveCreditDay();
-		this.autoState!.twelve_credit_attempts =
-			(this.autoState!.twelve_credit_attempts ?? 0) + 1;
+		const state = this.autoState!;
+		if (now - state.rate_window_start_ms >= AUTO_RATE_WINDOW_MS) {
+			state.rate_window_start_ms = now;
+			state.rate_requests = 0;
+		}
+		if (state.rate_requests >= AUTO_MAX_REQUESTS_PER_WINDOW) return false;
+		state.rate_requests++;
+		return true;
+	}
+
+	private recordTwelveCreditAttempt(key: TwelveApiKeyBinding, now = Date.now()) {
+		this.ensureAutoState();
+		this.refreshTwelveCreditDay(now);
+		const state = this.autoState!;
+		state.twelve_credit_attempts = (state.twelve_credit_attempts ?? 0) + 1;
+		const keyState = state.twelve_key_states?.[key.id];
+		if (keyState) {
+			keyState.attempts++;
+			keyState.last_response_ms = now;
+		}
+	}
+
+	private readTwelveCreditHeader(headers: Headers, name: string) {
+		const raw = headers.get(name);
+		if (raw == null || raw.trim() === "") return null;
+		const parsed = Number(raw);
+		return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+	}
+
+	private applyTwelveCreditHeaders(
+		key: TwelveApiKeyBinding,
+		headers: Headers,
+		now = Date.now(),
+	) {
+		this.refreshTwelveCreditDay(now);
+		const keyState = this.autoState?.twelve_key_states?.[key.id];
+		if (!keyState) return;
+		const used = this.readTwelveCreditHeader(headers, "api-credits-used");
+		const left = this.readTwelveCreditHeader(headers, "api-credits-left");
+		if (used != null) keyState.minute_credits_used = used;
+		if (left != null) keyState.minute_credits_left = left;
+		if (used != null && left != null) keyState.minute_credit_limit = used + left;
+		keyState.last_response_ms = now;
+		if (left != null && left <= 0) {
+			// On the Basic plan these response headers describe the current minute
+			// credit window (8/minute), not the separate 800/day cap. Rotate to the
+			// next key for the remainder of the minute; only an explicit daily-quota
+			// error blocks a key until midnight UTC.
+			keyState.blocked_until_ms = this.nextTwelveMinuteResetMs(now);
+			keyState.block_reason = "rate_limit";
+			keyState.last_error = "Provider response reports zero credits left in the current minute window";
+		}
+	}
+
+	private markTwelveKeyQuotaFailure(
+		key: TwelveApiKeyBinding,
+		error: unknown,
+		now = Date.now(),
+	) {
+		this.refreshTwelveCreditDay(now);
+		const keyState = this.autoState?.twelve_key_states?.[key.id];
+		if (!keyState) return this.nextTwelveCreditResetMs(now);
+		const message = error instanceof Error ? error.message : String(error);
+		const retryAt = this.nextTwelveCreditResetMs(now);
+		keyState.blocked_until_ms = retryAt;
+		keyState.block_reason = "daily_quota";
+		keyState.last_error = message;
+		keyState.last_response_ms = now;
+		return retryAt;
+	}
+
+	private markTwelveKeyRateLimit(
+		key: TwelveApiKeyBinding,
+		error: unknown,
+		now = Date.now(),
+	) {
+		this.refreshTwelveCreditDay(now);
+		const keyState = this.autoState?.twelve_key_states?.[key.id];
+		if (!keyState) return this.nextTwelveMinuteResetMs(now);
+		keyState.blocked_until_ms = this.nextTwelveMinuteResetMs(now);
+		keyState.block_reason = "rate_limit";
+		keyState.last_error = error instanceof Error ? error.message : String(error);
+		keyState.last_response_ms = now;
+		return keyState.blocked_until_ms;
+	}
+
+	private markTwelveKeyInvalid(
+		key: TwelveApiKeyBinding,
+		error: unknown,
+		now = Date.now(),
+	) {
+		this.refreshTwelveCreditDay(now);
+		const keyState = this.autoState?.twelve_key_states?.[key.id];
+		if (!keyState) return now + TWELVE_INVALID_KEY_RETRY_MS;
+		keyState.blocked_until_ms = now + TWELVE_INVALID_KEY_RETRY_MS;
+		keyState.block_reason = "invalid_key";
+		keyState.last_error = error instanceof Error ? error.message : String(error);
+		keyState.last_response_ms = now;
+		return keyState.blocked_until_ms;
+	}
+
+	private markTwelveKeySuccess(key: TwelveApiKeyBinding, now = Date.now()) {
+		this.refreshTwelveCreditDay(now);
+		const state = this.autoState;
+		if (!state) return;
+		const keyState = state.twelve_key_states?.[key.id];
+		if (keyState) {
+			keyState.last_success_ms = now;
+			const exhaustedCurrentMinute =
+				keyState.block_reason === "rate_limit" &&
+				keyState.minute_credits_left != null &&
+				keyState.minute_credits_left <= 0;
+			if (!exhaustedCurrentMinute) {
+				keyState.last_error = null;
+				if (keyState.block_reason !== "daily_quota") {
+					keyState.blocked_until_ms = null;
+					keyState.block_reason = null;
+				}
+			}
+		}
+		if (keyState?.minute_credits_left != null && keyState.minute_credits_left <= 0) {
+			const next = this.availableTwelveDataKeys(now).find((candidate) => candidate.id !== key.id);
+			state.twelve_active_key_slot = next?.slot ?? key.slot;
+		} else {
+			state.twelve_active_key_slot = key.slot;
+		}
 	}
 
 	private autoQueuePriority(item: AutoQueueItem) {
@@ -4576,7 +4951,55 @@ export class Chat extends DurableObject<LiveEnv> {
 
 	private publicAutoState() {
 		this.ensureAutoState();
+		this.refreshTwelveCreditDay();
 		const state = this.autoState!;
+		const now = Date.now();
+		const configuredKeys = this.twelveDataApiKeys();
+		const availableKeys = this.availableTwelveDataKeys(now);
+		const availableIds = new Set(availableKeys.map((key) => key.id));
+		const keyPool = configuredKeys.map((key) => {
+			const keyState = state.twelve_key_states?.[key.id] ?? null;
+			let status = "standby";
+			if (keyState?.block_reason === "daily_quota") {
+				status = "daily_exhausted";
+			} else if (keyState?.block_reason === "rate_limit" && (keyState.blocked_until_ms ?? 0) > now) {
+				status = "temporarily_rate_limited";
+			} else if (keyState?.block_reason === "invalid_key" && (keyState.blocked_until_ms ?? 0) > now) {
+				status = "invalid_key";
+			} else if (key.slot === state.twelve_active_key_slot && availableIds.has(key.id)) {
+				status = "active";
+			} else if (availableIds.has(key.id)) {
+				status = "standby";
+			} else {
+				status = "blocked";
+			}
+			return {
+				id: key.id,
+				secret_name: key.secret_name,
+				status,
+				attempts_today: keyState?.attempts ?? 0,
+				minute_credits_used: keyState?.minute_credits_used ?? null,
+				minute_credits_left: keyState?.minute_credits_left ?? null,
+				minute_credit_limit:
+					keyState?.minute_credit_limit ??
+					(keyState?.minute_credits_used == null && keyState?.minute_credits_left == null
+						? null
+						: TWELVE_DEFAULT_MINUTE_CREDIT_LIMIT),
+				blocked_until:
+					keyState?.blocked_until_ms != null
+						? cairoTime(keyState.blocked_until_ms)
+						: null,
+				block_reason: keyState?.block_reason ?? null,
+				last_success_time:
+					keyState?.last_success_ms != null
+						? cairoTime(keyState.last_success_ms)
+						: null,
+				last_error: keyState?.last_error ?? null,
+			};
+		});
+		const knownCreditsLeft = keyPool
+			.map((entry) => entry.minute_credits_left)
+			.filter((value): value is number => value != null);
 		return {
 			enabled: state.enabled,
 			queue_length: state.queue.length,
@@ -4612,21 +5035,35 @@ export class Chat extends DurableObject<LiveEnv> {
 					? cairoTime(state.last_recovery_audit_ms)
 					: null,
 			credit_safety: {
+				mode: "multi_key_failover",
 				utc_day: state.twelve_credit_utc_day ?? null,
-				estimated_worker_rest_attempts: state.twelve_credit_attempts ?? 0,
-				provider_daily_limit: TWELVE_DAILY_CREDIT_LIMIT,
-				historical_auto_ceiling: TWELVE_HISTORICAL_AUTO_CEILING,
-				current_auto_ceiling: TWELVE_CURRENT_AUTO_CEILING,
-				manual_hard_ceiling: TWELVE_MANUAL_HARD_CEILING,
-				reserved_below_provider_limit:
-					TWELVE_DAILY_CREDIT_LIMIT - TWELVE_MANUAL_HARD_CEILING,
-				quota_block_until:
-					state.twelve_quota_block_until_ms != null
-						? cairoTime(state.twelve_quota_block_until_ms)
+				estimated_worker_rest_attempts_total: state.twelve_credit_attempts ?? 0,
+				configured_keys: configuredKeys.length,
+				available_keys: availableKeys.length,
+				active_key:
+					state.twelve_active_key_slot != null
+						? `key_${state.twelve_active_key_slot}`
 						: null,
-				quota_last_error: state.twelve_quota_last_error ?? null,
+				fixed_540_650_700_ceilings: "removed",
+				provider_header_tracking: "api-credits-used + api-credits-left (current minute window)",
+				basic_daily_limit_reference_per_key: TWELVE_BASIC_DAILY_LIMIT_REFERENCE,
+				daily_policy: "no proactive daily cutoff; use the key until Twelve Data explicitly reports daily quota exhaustion, then rotate",
+				known_total_minute_credits_left:
+					knownCreditsLeft.length > 0
+						? knownCreditsLeft.reduce((sum, value) => sum + value, 0)
+						: null,
 				readiness_policy:
 					"ensure-data-ready audits/enqueues only; provider REST is background-alarm owned",
+				pool_policy:
+					"use active key until provider quota/rate/auth block; immediately fail over to the next configured key; no credit-class ceiling blocks historical recovery",
+			},
+			api_key_pool: {
+				configured_keys: configuredKeys.length,
+				active_key:
+					state.twelve_active_key_slot != null
+						? `key_${state.twelve_active_key_slot}`
+						: null,
+				keys: keyPool,
 			},
 			continuity: {
 				fast_overlap_buckets: CONTINUITY_FAST_OVERLAP_BUCKETS,
@@ -4638,11 +5075,27 @@ export class Chat extends DurableObject<LiveEnv> {
 				active_gaps: Object.values(state.continuity_active_gaps ?? {}),
 			},
 			cadence: {
+				mode:
+					configuredKeys.length >= 2
+						? "full_authoritative_multi_key"
+						: "single_key_credit_safe",
 				"1min_rest": "every 5 minutes while market is open",
-				"5min_rest": "every 10 minutes while market is open",
-				"15min_rest": "every 30 minutes while market is open",
-				"30min_rest": "every hour while market is open",
-				"1h_rest": "every 2 hours while market is open",
+				"5min_rest":
+					configuredKeys.length >= 2
+						? "every 5 minutes while market is open"
+						: "every 10 minutes while market is open",
+				"15min_rest":
+					configuredKeys.length >= 2
+						? "every 15 minutes while market is open"
+						: "every 30 minutes while market is open",
+				"30min_rest":
+					configuredKeys.length >= 2
+						? "every 30 minutes while market is open"
+						: "every hour while market is open",
+				"1h_rest":
+					configuredKeys.length >= 2
+						? "every hour while market is open"
+						: "every 2 hours while market is open",
 				"4h_rest": "not scheduled; confirmed 4H is derived locally from authoritative 1H",
 				"1day_rest": "after each trading-day close",
 				"1week_rest": "after Friday trading closes / Saturday 00:00 Cairo",
@@ -5922,68 +6375,117 @@ export class Chat extends DurableObject<LiveEnv> {
 		const marketClosed = isClosedMarketCairoDatetime(nowCairo);
 		const fiveKey = scheduleBucketKey(nowCairo, 5);
 		const tenKey = scheduleBucketKey(nowCairo, 10);
+		const fifteenKey = scheduleBucketKey(nowCairo, 15);
 		const thirtyKey = scheduleBucketKey(nowCairo, 30);
 		const hourKey = scheduleBucketKey(nowCairo, 60);
 		const twoHourKey = twoHourScheduleKey(nowCairo);
 		const fourKey = fourHourScheduleKey(nowCairo);
 		const currentDateKey = dateKey(nowCairo);
 		const currentMonthKey = monthKey(nowCairo);
+		const hasBackupKey = this.twelveDataApiKeys().length >= 2;
 
-		// v16.1 credit-safe cadence. Native REST confirmation remains comfortably
-		// inside each timeframe's existing freshness allowance, but no longer spends
-		// ~700 credits/day before recovery work even begins.
-		if (fiveKey !== state.last_5m_key) {
-			state.last_5m_key = fiveKey;
-			if (!marketClosed) {
-				this.enqueueAutoIntervals(
-					["1min"],
-					AUTO_INCREMENTAL_OUTPUTSIZE,
-					"1m_5m_cadence",
-				);
+		// v16.2 adaptive cadence:
+		// - with 2+ configured keys, restore full native-authoritative cadence so the
+		//   confirmed layers stay close to real time and fail over when a key exhausts;
+		// - with only one key, retain the v16.1 credit-safe cadence until a backup is added.
+		if (hasBackupKey) {
+			if (fiveKey !== state.last_5m_key) {
+				state.last_5m_key = fiveKey;
+				if (!marketClosed) {
+					this.enqueueAutoIntervals(
+						["1min", "5min"],
+						AUTO_INCREMENTAL_OUTPUTSIZE,
+						"full_5m_cadence",
+					);
+				}
 			}
-		}
 
-		if (tenKey !== state.last_10m_key) {
-			state.last_10m_key = tenKey;
-			if (!marketClosed) {
-				this.enqueueAutoIntervals(
-					["5min"],
-					AUTO_INCREMENTAL_OUTPUTSIZE,
-					"5m_10m_cadence",
-				);
+			if (fifteenKey !== state.last_15m_key) {
+				state.last_15m_key = fifteenKey;
+				if (!marketClosed) {
+					this.enqueueAutoIntervals(
+						["15min"],
+						AUTO_INCREMENTAL_OUTPUTSIZE,
+						"full_15m_cadence",
+					);
+				}
 			}
-		}
 
-		if (thirtyKey !== state.last_30m_key) {
-			state.last_30m_key = thirtyKey;
-			if (!marketClosed) {
-				this.enqueueAutoIntervals(
-					["15min"],
-					AUTO_INCREMENTAL_OUTPUTSIZE,
-					"15m_30m_cadence",
-				);
+			if (thirtyKey !== state.last_30m_key) {
+				state.last_30m_key = thirtyKey;
+				if (!marketClosed) {
+					this.enqueueAutoIntervals(
+						["30min"],
+						AUTO_INCREMENTAL_OUTPUTSIZE,
+						"full_30m_cadence",
+					);
+				}
 			}
-		}
 
-		if (hourKey !== state.last_hour_key) {
-			state.last_hour_key = hourKey;
-			if (!marketClosed) {
-				this.enqueueAutoIntervals(
-					["30min"],
-					AUTO_INCREMENTAL_OUTPUTSIZE,
-					"30m_hour_cadence",
-				);
+			if (hourKey !== state.last_hour_key) {
+				state.last_hour_key = hourKey;
+				if (!marketClosed) {
+					this.enqueueAutoIntervals(
+						["1h"],
+						AUTO_INCREMENTAL_OUTPUTSIZE,
+						"full_1h_cadence",
+					);
+				}
 			}
-		}
+		} else {
+			if (fiveKey !== state.last_5m_key) {
+				state.last_5m_key = fiveKey;
+				if (!marketClosed) {
+					this.enqueueAutoIntervals(
+						["1min"],
+						AUTO_INCREMENTAL_OUTPUTSIZE,
+						"1m_5m_cadence",
+					);
+				}
+			}
 
-		if (twoHourKey !== state.last_2h_key) {
-			state.last_2h_key = twoHourKey;
-			if (!marketClosed) {
-				this.enqueueAutoIntervals(
-					["1h"],
-					AUTO_INCREMENTAL_OUTPUTSIZE,
-					"1h_2h_cadence",
-				);
+			if (tenKey !== state.last_10m_key) {
+				state.last_10m_key = tenKey;
+				if (!marketClosed) {
+					this.enqueueAutoIntervals(
+						["5min"],
+						AUTO_INCREMENTAL_OUTPUTSIZE,
+						"5m_10m_cadence",
+					);
+				}
+			}
+
+			if (thirtyKey !== state.last_30m_key) {
+				state.last_30m_key = thirtyKey;
+				if (!marketClosed) {
+					this.enqueueAutoIntervals(
+						["15min"],
+						AUTO_INCREMENTAL_OUTPUTSIZE,
+						"15m_30m_cadence",
+					);
+				}
+			}
+
+			if (hourKey !== state.last_hour_key) {
+				state.last_hour_key = hourKey;
+				if (!marketClosed) {
+					this.enqueueAutoIntervals(
+						["30min"],
+						AUTO_INCREMENTAL_OUTPUTSIZE,
+						"30m_hour_cadence",
+					);
+				}
+			}
+
+			if (twoHourKey !== state.last_2h_key) {
+				state.last_2h_key = twoHourKey;
+				if (!marketClosed) {
+					this.enqueueAutoIntervals(
+						["1h"],
+						AUTO_INCREMENTAL_OUTPUTSIZE,
+						"1h_2h_cadence",
+					);
+				}
 			}
 		}
 
@@ -6200,7 +6702,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			}
 
 			state.queue.splice(itemIndex, 1);
-			state.rate_requests++;
+			// Actual automatic REST attempts are counted inside fetchHistoricalDirect(),
+			// including any key failover attempt. This keeps the 7/minute guard accurate.
 			// For guarded recovery/bootstrap, checkpoint queue removal before heavy
 			// work. Routine current-cadence items are diff-upserts and are persisted
 			// once after processing, avoiding one metadata write per item.
@@ -6269,12 +6772,24 @@ export class Chat extends DurableObject<LiveEnv> {
 							: String(error);
 				}
 			} else {
-				item.attempts++;
-				state.last_error = String(
+				const resultError = String(
 					(result as { error?: unknown }).error ??
 						`Auto refresh failed for ${item.interval}`,
 				);
+				state.last_error = resultError;
 
+				if (
+					resultError.startsWith("TWELVE_RATE_WINDOW_WAIT") ||
+					resultError.startsWith("TWELVE_KEY_POOL_EXHAUSTED") ||
+					resultError.includes("No Twelve Data API key is configured")
+				) {
+					// Provider-capacity failures are not candle/recovery failures. Keep the
+					// queue item intact and retry it when a key/window becomes available.
+					state.queue.push(item);
+					break;
+				}
+
+				item.attempts++;
 				if (item.attempts < 3) {
 					state.queue.push(item);
 				}
@@ -6376,21 +6891,16 @@ export class Chat extends DurableObject<LiveEnv> {
 				state.last_error?.startsWith("RECOVERY_BUDGET_PAUSED") ?? false;
 			this.refreshTwelveCreditDay();
 			const nowForDelay = Date.now();
-			const providerBlockUntil = state.twelve_quota_block_until_ms ?? null;
-			const workerCreditsUsed = state.twelve_credit_attempts ?? 0;
+			const poolGuard = this.twelveCreditGuard("auto_current", nowForDelay);
 			const globalAutoCreditPauseUntil =
-				providerBlockUntil !== null && providerBlockUntil > nowForDelay
-					? providerBlockUntil
-					: workerCreditsUsed >= TWELVE_CURRENT_AUTO_CEILING
-						? this.nextTwelveCreditResetMs(nowForDelay)
-						: null;
-			const hasRunnableProviderWork = state.queue.some((item) =>
-				this.twelveCreditGuard(this.twelveCreditClassForQueueItem(item), nowForDelay).allowed,
-			);
+				!poolGuard.allowed && poolGuard.retry_at_ms != null
+					? poolGuard.retry_at_ms
+					: null;
+			const hasRunnableProviderWork = state.queue.length > 0 && poolGuard.allowed;
 			const delay =
 				globalAutoCreditPauseUntil !== null
 					? Math.max(
-						AUTO_IDLE_ALARM_MS,
+						1_000,
 						globalAutoCreditPauseUntil - nowForDelay,
 					)
 					: state.queue.length > 0 &&
