@@ -2,9 +2,33 @@ import { DurableObject } from "cloudflare:workers";
 import { handleGoldMcpRequest } from "./mcp";
 
 const SYMBOL = "XAU/USD";
+// Keep Twelve Data's original request timezone unchanged. This is NOT
+// the analytical market clock; only provider intraday timestamps use it.
 const TIMEZONE = "Africa/Cairo";
+const US_CLOCK_REPAIR_KEY = "us_clock_nov_2026_repair_v1";
+const US_CLOCK_REPAIR_START = "2026-11-01 08:00:00";
+const US_CLOCK_REPAIR_MAX_CHANGED_ROWS_PER_UTC_DAY = 8_000;
+const US_CLOCK_REPAIR_BATCHES_PER_ALARM = 3;
+const US_CLOCK_REPAIR_DELAY_MS = 15_000;
+const US_CLOCK_REPAIR_INTERVALS = ["1min", "5min", "15min", "30min", "1h", "3min", "4h", "cleanup"] as const;
+type UsClockRepairStage = (typeof US_CLOCK_REPAIR_INTERVALS)[number];
+type UsClockRepairState = {
+    status: "running" | "completed" | "completed_with_missing_raw" | "paused_error";
+    started_at_ms: number;
+    until_datetime: string;
+    stage_index: number;
+    cursor: string;
+    changed_rows: number;
+    steps_completed: number;
+    missing_raw_windows: number;
+    daily_utc_date: string;
+    daily_changed_rows: number;
+    last_error: string | null;
+    completed_at_ms?: number;
+};
+
 const TWELVE_DATA_REST_URL = "https://api.twelvedata.com/time_series";
-const BUILD_VERSION = "v16.2-multi-key-failover-2026-10-01";
+const BUILD_VERSION = "v16.3-us-dst-clock-native-rest-one-time-repair-2026-11-05";
 const PROD_OBJECT_NAME = "XAUUSD_V14_6_PROD_20260909";
 const LEGACY_OBJECT_NAME = "XAUUSD";
 const RETIRED_OBJECT_NAMES = ["XAUUSD", "XAUUSD_V14_5_PROD_20260909"] as const;
@@ -473,6 +497,7 @@ type LiveEnv = {
 	TWELVEDATA_API_KEY?: string;
 	// Optional explicit key_1 alias plus dynamically discovered _2, _3, ... keys.
 	TWELVEDATA_API_KEY_1?: string;
+	GOLD_CLOCK_REPAIR_TOKEN?: string;
 	Chat: DurableObjectNamespace;
 	[key: string]: unknown;
 };
@@ -523,12 +548,73 @@ function minuteStart(ms: number) {
 	return Math.floor(ms / 60_000) * 60_000;
 }
 
-function cairoTime(ms: number) {
-	// Project rule: Cairo is always treated as fixed GMT+2.
-	// Do not use Africa/Cairo DST rules here.
-	const shifted = new Date(ms + 2 * 60 * 60 * 1000);
-	return shifted.toISOString().slice(0, 19).replace("T", " ");
+// US Eastern Daylight Saving: second Sunday in March at 07:00 UTC,
+// first Sunday in November at 06:00 UTC. The analytical server clock
+// remains the same wall-hour convention used by the original system:
+// GMT+3 during US DST, GMT+2 during US standard time. No manual toggle.
+function sundayOfMonth(year: number, monthZeroBased: number, nth: number) {
+    const firstDay = new Date(Date.UTC(year, monthZeroBased, 1)).getUTCDay();
+    return 1 + ((7 - firstDay) % 7) + 7 * (nth - 1);
 }
+function usDstBoundaries(year: number) {
+    return {
+        start_ms: Date.UTC(year, 2, sundayOfMonth(year, 2, 2), 7),
+        end_ms: Date.UTC(year, 10, sundayOfMonth(year, 10, 1), 6),
+    };
+}
+function marketClockOffset(ms: number): 2 | 3 {
+    const year = new Date(ms).getUTCFullYear();
+    const b = usDstBoundaries(year);
+    return ms >= b.start_ms && ms < b.end_ms ? 3 : 2;
+}
+function cairoTime(ms: number) {
+    // Keep the legacy function name and all existing consumer contracts.
+    const shifted = new Date(ms + marketClockOffset(ms) * 3_600_000);
+    return shifted.toISOString().slice(0, 19).replace("T", " ");
+}
+function analyticalTimezoneNow() {
+    return `GMT+${marketClockOffset(Date.now())}`;
+}
+// Twelve Data still receives timezone=Africa/Cairo for intraday REST.
+// Re-label only the timestamps after receiving them, never the provider OHLC.
+// This is essential in March-April and late October when US and Egypt DST differ.
+const actualCairoFormatter = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Africa/Cairo", year: "numeric", month: "2-digit",
+    day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+    hourCycle: "h23",
+});
+function actualCairoTime(ms: number) {
+    const p: Record<string, string> = {};
+    for (const part of actualCairoFormatter.formatToParts(new Date(ms))) {
+        if (part.type !== "literal") p[part.type] = part.value;
+    }
+    return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
+}
+// Before 1 Nov 2026, persisted provider dates are intentionally untouched.
+const US_REPAIR_CUTOFF_UTC_MS = Date.UTC(2026, 10, 1, 6);
+function providerCairoDatetimeToMs(datetime: string) {
+    const parts = parseCairoDatetimeParts(datetime);
+    if (!parts) return null;
+    const local = Date.UTC(parts.year, parts.month - 1, parts.day,
+        parts.hour, parts.minute, parts.second);
+    for (const hours of [2, 3]) {
+        const utc = local - hours * 3_600_000;
+        if (actualCairoTime(utc) === canonicalCairoDatetime(datetime)) return utc;
+    }
+    return null;
+}
+function providerDatetimeToMarket(datetime: string, interval: RestInterval) {
+    if (!isNormalizedRestInterval(interval)) return datetime; // native daily+ preserved
+    const ms = providerCairoDatetimeToMs(datetime);
+    // Avoid rewriting/preprocessing the pre-transition historical source.
+    return ms !== null && ms >= US_REPAIR_CUTOFF_UTC_MS ? cairoTime(ms) : datetime;
+}
+function marketDatetimeToProvider(datetime: string, interval: RestInterval) {
+    if (!isNormalizedRestInterval(interval)) return datetime;
+    const ms = cairoDatetimeToMs(datetime);
+    return ms !== null && ms >= US_REPAIR_CUTOFF_UTC_MS ? actualCairoTime(ms) : datetime;
+}
+
 
 function isRestInterval(value: string): value is RestInterval {
 	return (REST_INTERVALS as readonly string[]).includes(value);
@@ -644,18 +730,18 @@ function cairoDatetimeToMs(datetime: string) {
 	const parts = parseCairoDatetimeParts(datetime);
 	if (!parts) return null;
 
-	// Project rule: Cairo is treated as fixed GMT+2.
-	return (
-		Date.UTC(
-			parts.year,
-			parts.month - 1,
-			parts.day,
-			parts.hour,
-			parts.minute,
-			parts.second,
-		) -
-		2 * 60 * 60 * 1000
-	);
+// Invert using the offset that was in force AT THAT HISTORICAL INSTANT.
+// Sundays at the US switch are market-closed, so repeated/nonexistent
+// clock hours must not cause duplicate traded-candle keys.
+const wall = Date.UTC(parts.year, parts.month - 1, parts.day,
+    parts.hour, parts.minute, parts.second);
+for (const offset of [2, 3] as const) {
+    const utc = wall - offset * 3_600_000;
+    if (marketClockOffset(utc) === offset && cairoTime(utc) === canonicalCairoDatetime(datetime)) {
+        return utc;
+    }
+}
+return null;
 }
 
 function addMinutesToCairoDatetime(
@@ -870,6 +956,7 @@ export class Chat extends DurableObject<LiveEnv> {
 	private subscribeStatus: unknown = null;
 	private autoState: AutoRefreshState | null = null;
 	private twelveApiKeysCache: TwelveApiKeyBinding[] | null = null;
+    private clockRepairState: UsClockRepairState | null = null;
 
 	// v15.8 lazy-storage lifecycle state. None of these fields are persisted;
 	// they exist only to stop repeated quota reads inside one runtime instance.
@@ -973,6 +1060,7 @@ export class Chat extends DurableObject<LiveEnv> {
 	}
 
 	private async loadPersistentState() {
+        this.clockRepairState = (await this.ctx.storage.get<UsClockRepairState>(US_CLOCK_REPAIR_KEY)) ?? null;
 		const saved = await this.ctx.storage.get<{
 			enabled?: boolean;
 			lastPrice?: number | null;
@@ -1015,7 +1103,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			this.candles = (saved.candles ?? [])
 				.filter(
 					(candle) =>
-						!isClosedMarketCairoDatetime(candle.datetime),
+						!isClosedMarketCairoDatetime(candle.datetime) &&
+                        candle.datetime === cairoTime(candle.start_ms),
 				)
 				.map((candle) => ({
 					...candle,
@@ -1025,7 +1114,8 @@ export class Chat extends DurableObject<LiveEnv> {
 			const restoredCurrent = saved.currentCandle ?? null;
 			this.currentCandle =
 				restoredCurrent &&
-				!isClosedMarketCairoDatetime(restoredCurrent.datetime)
+				!isClosedMarketCairoDatetime(restoredCurrent.datetime) &&
+                restoredCurrent.datetime === cairoTime(restoredCurrent.start_ms)
 					? {
 						...restoredCurrent,
 						gap_adjusted: restoredCurrent.gap_adjusted ?? false,
@@ -1223,8 +1313,211 @@ export class Chat extends DurableObject<LiveEnv> {
 		}
 	}
 
+private clockStatus() {
+    const now = Date.now();
+    const b = usDstBoundaries(new Date(now).getUTCFullYear());
+    const next = now < b.start_ms ? b.start_ms : now < b.end_ms ? b.end_ms
+      : usDstBoundaries(new Date(now).getUTCFullYear() + 1).start_ms;
+    return {
+        status: "ok", build_version: BUILD_VERSION,
+        regime: "automatic_us_dst", offset_hours: marketClockOffset(now),
+        analytical_clock: cairoTime(now),
+        next_us_transition_utc: new Date(next).toISOString(),
+        twelve_data_request_timezone: TIMEZONE,
+        daily_weekly_monthly: "native_Twelve_Data_REST_unchanged",
+        clock_repair: this.clockRepairState,
+    };
+}
+
+private async clockRepairAuthorized(request: Request) {
+    const secret = this.env.GOLD_CLOCK_REPAIR_TOKEN;
+    if (typeof secret !== "string" || secret.length < 32) return false;
+    const presented = request.headers.get("Authorization") ?? "";
+    if (!presented.startsWith("Bearer ")) return false;
+    const candidate = presented.slice(7);
+    if (candidate.length < 32) return false;
+    const encoder = new TextEncoder();
+    const [a,b] = await Promise.all([
+        crypto.subtle.digest("SHA-256", encoder.encode(secret)),
+        crypto.subtle.digest("SHA-256", encoder.encode(candidate)),
+    ]);
+    const x = new Uint8Array(a), y = new Uint8Array(b);
+    let difference = 0;
+    for (let i = 0; i < x.length; i++) difference |= x[i] ^ y[i];
+    return difference === 0;
+}
+
+private async clockRepairCommand(request: Request) {
+    if (!this.isProductionInstance()) return json({status:"forbidden",error:"production_only"},403);
+    if (!await this.clockRepairAuthorized(request)) {
+        return json({status:"unauthorized",hint:"Set GOLD_CLOCK_REPAIR_TOKEN (32+ chars) as Worker secret"},401);
+    }
+    if (request.method === "GET") return json(this.clockStatus());
+    if (request.method !== "POST") return json({status:"method_not_allowed"},405);
+    let input: {action?: string} = {};
+    try { input = await request.json() as {action?: string}; }
+    catch { return json({status:"invalid_json"},400); }
+    if (input.action !== "start" && input.action !== "resume") {
+        return json({status:"invalid_action",allowed:["start","resume"]},400);
+    }
+    this.ensureAutoState();
+    if (!this.autoState!.enabled) return json({status:"blocked",error:"auto_refresh_disabled"},409);
+    if (input.action === "start") {
+        if (this.clockRepairState) return json({status:"already_exists",repair:this.clockRepairState},409);
+        const now = Date.now();
+        const until = cairoTime(now - 60_000); // freeze one-time repair window
+        this.clockRepairState = {
+            status:"running",started_at_ms:now,until_datetime:until,
+            stage_index:0,cursor:US_CLOCK_REPAIR_START,
+            changed_rows:0,steps_completed:0,missing_raw_windows:0,
+            daily_utc_date:new Date(now).toISOString().slice(0,10),
+            daily_changed_rows:0,last_error:null,
+        };
+        await this.ctx.storage.put(US_CLOCK_REPAIR_KEY,this.clockRepairState);
+    } else {
+        if (!this.clockRepairState || this.clockRepairState.status !== "paused_error") {
+            return json({status:"nothing_to_resume",repair:this.clockRepairState},409);
+        }
+        this.clockRepairState.status="running";
+        this.clockRepairState.last_error=null;
+        await this.ctx.storage.put(US_CLOCK_REPAIR_KEY,this.clockRepairState);
+    }
+    // Command starts an incremental background-in-DO operation, not a single
+    // dangerous unbounded request. The existing DO alarms continue it.
+    const alarm = await this.scheduleAutoAlarm(1_000);
+    return json({status:"accepted",alarm_scheduled:alarm,repair:this.clockRepairState},202);
+}
+
+private async runClockRepairBatch() {
+    const r = this.clockRepairState;
+    if (!r || r.status !== "running") return;
+    const today = new Date().toISOString().slice(0,10);
+    if (today !== r.daily_utc_date) { r.daily_utc_date=today; r.daily_changed_rows=0; }
+    if (r.daily_changed_rows >= US_CLOCK_REPAIR_MAX_CHANGED_ROWS_PER_UTC_DAY) return;
+    const startMs = Date.now();
+    for (let step = 0; step < US_CLOCK_REPAIR_BATCHES_PER_ALARM && Date.now()-startMs < 8_000; step++) {
+        if (r.status !== "running") break;
+        if (r.stage_index >= US_CLOCK_REPAIR_INTERVALS.length) {
+            r.status=r.missing_raw_windows>0 ? "completed_with_missing_raw" : "completed";
+            r.completed_at_ms=Date.now();break;
+        }
+        const stage: UsClockRepairStage=US_CLOCK_REPAIR_INTERVALS[r.stage_index];
+        if (r.cursor > r.until_datetime) {
+            r.stage_index++;
+            r.cursor = US_CLOCK_REPAIR_INTERVALS[r.stage_index] === "cleanup"
+                ? r.until_datetime : US_CLOCK_REPAIR_START;
+            continue;
+        }
+        const duration = stage === "1min" || stage === "3min" ? 240
+          : stage === "cleanup" ? 360 : 1440;
+        const endCandidate=addMinutesToCairoDatetime(r.cursor,duration-1);
+        const end=endCandidate < r.until_datetime ? endCandidate : r.until_datetime;
+        try {
+            let changed=0;
+            if (stage === "1min" || stage === "5min" || stage === "15min" ||
+                stage === "30min" || stage === "1h") {
+                const raw=await this.listHistoricalRange(stage,r.cursor,end);
+                if (raw.length === 0) {
+                    // Never fabricate provider rows and never run full bootstrap.
+                    // A window can begin during the 00:00-01:00 closure yet
+                    // still contain trading hours. Do not falsely mark it complete.
+                    const fromMs = cairoDatetimeToMs(r.cursor);
+                    const toMs = cairoDatetimeToMs(end);
+                    let tradableWindow = false;
+                    if (fromMs !== null && toMs !== null) {
+                        for (let ms=fromMs; ms<=toMs; ms+=60*60_000) {
+                            if (!isClosedMarketCairoDatetime(cairoTime(ms))) {
+                                tradableWindow = true;
+                                break;
+                            }
+                        }
+                    } else {
+                        tradableWindow = !isClosedMarketCairoDatetime(r.cursor);
+                    }
+                    if (tradableWindow) r.missing_raw_windows++;
+                } else {
+                    const result=await this.normalizeStoredIntervalRange(stage,r.cursor,end);
+                    if (result.status !== "ok") throw new Error("normalization_failed:"+stage);
+                    changed = (result.rows_written ?? 0)+(result.rows_deleted ?? 0);
+                }
+            } else if (stage === "3min") {
+                // Only the original derived layer; never add a new daily deriver.
+                const source=await this.listNormalizedRange("1min",r.cursor,end);
+                if (source.length > 0) {
+                    const result=await this.deriveThreeMinuteRangeFromOneMinute(r.cursor,end);
+                    changed=result.written+result.deleted;
+                }
+            } else if (stage === "4h") {
+                // Existing original 1H-derived 4H engine. Do not rebuild a
+                // bucket unless the child hours have been verified complete.
+                for (let bucket=r.cursor;bucket<=end;bucket=addMinutesToCairoDatetime(bucket,240)) {
+                    const start=fourHourBucketStart(bucket);
+                    if (!start || start !== bucket) continue;
+                    const parts=parseCairoDatetimeParts(start);
+                    if (!parts) continue;
+                    const expected=(parts.hour === 0 ? [60,120,180] : [0,60,120,180])
+                      .map(n=>addMinutesToCairoDatetime(start,n));
+                    const rows=await this.listNormalizedRange("1h",start,addMinutesToCairoDatetime(start,180));
+                    if (rows.length !== expected.length || !expected.every((t,i)=>rows[i]?.datetime===t)) continue;
+                    if (parts.hour === 0 && rows[0].gap_adjusted !== true) continue;
+                    const result=await this.deriveFourHourRangeFromOneHour(start,start);
+                    changed+=result.written+result.deleted;
+                }
+            } else {
+                // Remove only bogus future synthetic rows produced by the
+                // old +3 clock, never legitimate historical provider rows.
+                for (const interval of ["1min","3min"] as const) {
+                    const horizon=addMinutesToCairoDatetime(r.until_datetime,120);
+                    const rows=await this.listNormalizedRange(interval,r.cursor,horizon);
+                    const bad=rows.filter(c =>
+                        (c.source === "synthetic_bridge_approximation" ||
+                         c.source === "derived_1min_with_synthetic_bridge") &&
+                        (cairoDatetimeToMs(c.datetime) ?? 0) > r.started_at_ms);
+                    for (let i=0;i<bad.length;i+=100) {
+                        await this.ctx.storage.delete(bad.slice(i,i+100)
+                          .map(c=>normalizedCandleKey(interval,c.datetime)));
+                        changed+=Math.min(100,bad.length-i);
+                    }
+                    if (bad.length>0) {
+                        // The normal 1M metadata otherwise keeps pointing at
+                        // a deleted future candle. No historical data is refetched.
+                        const newest = await this.ctx.storage.list<NormalizedCandle>({
+                            prefix: normalizedPrefix(interval), reverse:true, limit:1,
+                        });
+                        const latest=Array.from(newest.values())[0]??null;
+                        const meta=await this.ctx.storage.get<NormalizedMeta>(normalizedMetaKey(interval));
+                        if (meta && meta.latest_datetime !== (latest?.datetime??null)) {
+                            await this.ctx.storage.put(normalizedMetaKey(interval),{
+                                ...meta, latest_datetime: latest?.datetime??null,
+                                last_normalized_ms:Date.now(),last_normalized_time:cairoTime(Date.now()),
+                            });
+                            changed++;
+                        }
+                    }
+                }
+            }
+            r.changed_rows+=changed;
+            r.daily_changed_rows+=changed;
+            r.steps_completed++;
+            r.cursor=addMinutesToCairoDatetime(end,1);
+            if (r.daily_changed_rows>=US_CLOCK_REPAIR_MAX_CHANGED_ROWS_PER_UTC_DAY) break;
+        } catch (error) {
+            r.last_error=error instanceof Error ? error.message : String(error);
+            r.status="paused_error";
+            break;
+        }
+    }
+    if (r.stage_index>=US_CLOCK_REPAIR_INTERVALS.length) {
+        r.status=r.missing_raw_windows>0 ? "completed_with_missing_raw" : "completed";
+        r.completed_at_ms=Date.now();
+    }
+    await this.ctx.storage.put(US_CLOCK_REPAIR_KEY,r);
+}
+
 	private async handleFetch(request: Request) {
 		const url = new URL(request.url);
+        if (url.pathname === "/timezone-status") return json(this.clockStatus());
+        if (url.pathname === "/admin/clock-repair") return this.clockRepairCommand(request);
 
 		// Zero-write instance probe. This route is used to distinguish an
 		// account/platform quota problem from one poisoned/stuck Durable Object
@@ -1869,7 +2162,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			return json({
 				status: "ok",
 				symbol: SYMBOL,
-				timezone: TIMEZONE,
+				timezone: analyticalTimezoneNow(),
 				interval,
 				layer: "analysis_normalized_effective",
 				count: candles.length,
@@ -2091,7 +2384,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				status: "ok",
 				build_version: BUILD_VERSION,
 				symbol: SYMBOL,
-				timezone: TIMEZONE,
+				timezone: analyticalTimezoneNow(),
 				object_name: this.objectName(),
 				object_role:
 					this.isProductionInstance()
@@ -2100,6 +2393,7 @@ export class Chat extends DurableObject<LiveEnv> {
 							? "retired"
 							: "other",
 				market_closed: isClosedMarketCairoDatetime(cairoTime(Date.now())),
+                analytical_clock: {offset_hours:marketClockOffset(Date.now()), convention:"US_DST_GMT3_US_STANDARD_GMT2", provider_timezone: TIMEZONE},
 				last_live_price: this.lastPrice,
 				storage_migration: migration,
 				scheduled_alarm_ms: scheduledAlarmMs,
@@ -2790,12 +3084,12 @@ export class Chat extends DurableObject<LiveEnv> {
 			upstream.searchParams.set("apikey", key.api_key);
 
 			if (rangeStart) {
-				upstream.searchParams.set("start_date", rangeStart);
+				upstream.searchParams.set("start_date", marketDatetimeToProvider(rangeStart, interval));
 			}
 			if (rangeEnd) {
-				upstream.searchParams.set("end_date", rangeEnd);
+				upstream.searchParams.set("end_date", marketDatetimeToProvider(rangeEnd, interval));
 			} else if (before) {
-				upstream.searchParams.set("end_date", before);
+				upstream.searchParams.set("end_date", marketDatetimeToProvider(before, interval));
 			}
 
 			let response: Response;
@@ -2893,7 +3187,7 @@ export class Chat extends DurableObject<LiveEnv> {
 
 			const candles: unknown[][] = payload.values
 				.map((row) => [
-					row.datetime ?? "",
+					providerDatetimeToMarket(row.datetime ?? "", interval),
 					row.open ?? "",
 					row.high ?? "",
 					row.low ?? "",
@@ -6322,7 +6616,7 @@ export class Chat extends DurableObject<LiveEnv> {
 				status: "ok",
 				build_version: BUILD_VERSION,
 				symbol: SYMBOL,
-				timezone: TIMEZONE,
+				timezone: analyticalTimezoneNow(),
 				watchdog,
 				repair_requested: repairRequested,
 				repair_status: analysisReady
@@ -6850,6 +7144,12 @@ export class Chat extends DurableObject<LiveEnv> {
 				return;
 			}
 
+            // Explicit one-time repair, in small local-only batches; ordinary
+            // live/REST scheduling, provider fetch and daily native layers stay unchanged.
+            if (this.clockRepairState?.status === "running") {
+                try { await this.runClockRepairBatch(); }
+                catch (error) { this.lastError = error instanceof Error ? error.message : String(error); }
+            }
 			const beforeFingerprint = this.autoStateFingerprint();
 			state.last_alarm_ms = Date.now();
 
@@ -6916,7 +7216,9 @@ export class Chat extends DurableObject<LiveEnv> {
 							? AUTO_BUSY_ALARM_MS
 							: AUTO_IDLE_ALARM_MS;
 
-			await this.scheduleAutoAlarm(delay);
+            const repairOngoing=this.clockRepairState?.status === "running" &&
+              this.clockRepairState.daily_changed_rows < US_CLOCK_REPAIR_MAX_CHANGED_ROWS_PER_UTC_DAY;
+			await this.scheduleAutoAlarm(repairOngoing ? Math.min(delay,US_CLOCK_REPAIR_DELAY_MS) : delay);
 		} catch (error) {
 			if (this.isStorageReadQuotaError(error)) {
 				const retryAtMs = this.noteStorageReadQuotaFailure(error);
@@ -8141,7 +8443,7 @@ export class Chat extends DurableObject<LiveEnv> {
 			status: "ok",
 
 			symbol: SYMBOL,
-			timezone: TIMEZONE,
+			timezone: analyticalTimezoneNow(),
 
 			enabled: this.enabled,
 
